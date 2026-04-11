@@ -1,3 +1,12 @@
+(function(){
+"use strict";
+
+if (window.__EXECIQ_V7__) {
+  console.warn("[ExecIQ] Already running.");
+  return;
+}
+
+window.__EXECIQ_V7__ = true;
 "use strict";if (window.__EXECIQ_V7__){console.warn("[ExecIQ]Already running.");return;}window.__EXECIQ_V7__ = true;
 
 // CONFIGURATION
@@ -1433,3 +1442,4 @@ async function main(){
 }
 
 main();
+})();
