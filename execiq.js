@@ -7,7 +7,6 @@ if (window.__EXECIQ_V7__) {
 }
 
 window.__EXECIQ_V7__ = true;
-"use strict";if (window.__EXECIQ_V7__){console.warn("[ExecIQ]Already running.");return;}window.__EXECIQ_V7__ = true;
 
 // CONFIGURATION
 var SHEETJS = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
