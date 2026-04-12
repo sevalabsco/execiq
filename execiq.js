@@ -1,12 +1,4 @@
-(function(){
-"use strict";
-
-if (window.__EXECIQ_V7__) {
-  console.warn("[ExecIQ] Already running.");
-  return;
-}
-
-window.__EXECIQ_V7__ = true;
+javascript:(function (){"use strict";if (window.__EXECIQ_V7__){console.warn("[ExecIQ]Already running.");return;}window.__EXECIQ_V7__ = true;
 
 // CONFIGURATION
 var SHEETJS = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
@@ -73,6 +65,490 @@ var ConfigManager = (function(){
   return { load, save, clear };
 })();
 
+
+// ============================================================================
+// USER CUSTOMIZATION: Label Overrides
+// ============================================================================
+// Add your firm's custom field labels here
+// Format: "BACKEND_FIELD_NAME": "Your Custom Label"
+// 
+// Common customizations:
+//   - Firm Org fields: OFFICELIST, STUDIOLIST, PRACTICEAREALIST, etc.
+//   - Standard fields: Any field showing the wrong label
+//
+// Example:
+//   "OFFICELIST": "Location",
+//   "STUDIOLIST": "Practice Area",
+//   "ICOST": "Estimated Project Cost"
+//
+var USER_LABEL_OVERRIDES = {
+  // Add your custom labels here:
+  // "OFFICELIST": "Location",
+  // "STUDIOLIST": "Practice", 
+};
+// ============================================================================
+
+// ======= v7.2 FIELD MAPPING FROM GRID =======
+// Extract field labels from the ExtJS grid on the opportunities page
+
+function extractFieldMappingFromGrid() {
+  UI.log("Extracting field configuration from grid...", "ls");
+  
+  try {
+    // Find the ExtJS grid component
+    var grid = null;
+    
+    // Try to find grid by common IDs
+    var gridIds = ['ext-comp-1072', 'opportunity-grid', 'opp-grid'];
+    for (var i = 0; i < gridIds.length; i++) {
+      grid = Ext.getCmp(gridIds[i]);
+      if (grid && grid.colModel) break;
+    }
+    
+    if (!grid || !grid.colModel) {
+      UI.log("⚠ Could not find ExtJS grid", "lw");
+      return null;
+    }
+    
+    UI.log("✓ Found ExtJS grid", "ls");
+    
+    var cm = grid.colModel;
+    var mapping = {
+      version: "1.0",
+      timestamp: new Date().toISOString(),
+      source: "ExtJS grid extraction",
+      fields: {},
+      firmOrgLabels: {}
+    };
+    
+    var fieldCount = 0;
+    
+    // Extract column configuration
+    for (var i = 0; i < cm.getColumnCount(); i++) {
+      var config = cm.config[i];
+      if (!config) continue;
+      
+      var header = config.header || config.text || "";
+      var dataIndex = config.dataIndex;
+      
+      if (!dataIndex || !header) continue;
+      
+      mapping.fields[dataIndex] = {
+        label: header,
+        type: "text" // ExtJS doesn't expose type info easily
+      };
+      
+      // Track Firm Org labels
+      var firmOrgFields = ["OFFICELIST", "STUDIOLIST", "PRACTICEAREALIST", 
+                           "DIVISIONLIST", "TERRITORYLIST", "OFFICEDIVISIONLIST"];
+      if (firmOrgFields.includes(dataIndex.toUpperCase())) {
+        mapping.firmOrgLabels[dataIndex.toUpperCase()] = header;
+        UI.log("  Firm Org: " + dataIndex + " → " + header, "ls");
+      }
+      
+      fieldCount++;
+    }
+    
+    UI.log("✓ Extracted " + fieldCount + " field labels from grid", "ls");
+    UI.log("✓ Firm Org labels: " + JSON.stringify(mapping.firmOrgLabels), "ls");
+    
+    return mapping;
+    
+  } catch(e) {
+    UI.log("⚠ Error extracting from grid: " + e.message, "lw");
+    return null;
+  }
+}
+
+function loadFieldMapping() {
+  // Try to extract from grid first (if on grid page)
+  if (window.Ext && Ext.getCmp) {
+    var gridMapping = extractFieldMappingFromGrid();
+    if (gridMapping) return gridMapping;
+  }
+  
+  // Fallback: check localStorage
+  var stored = localStorage.getItem('ExecIQ_FieldMapping_v1');
+  if (!stored) return null;
+  
+  try {
+    var mapping = JSON.parse(stored);
+    var age = (Date.now() - new Date(mapping.timestamp)) / (1000 * 60 * 60 * 24);
+    UI.log("✓ Loaded field mapping from storage (" + Math.floor(age) + " days old)", "ls");
+    return mapping;
+  } catch(e) {
+    UI.log("⚠ Failed to parse field mapping", "lw");
+    return null;
+  }
+}
+
+// ======= END v7.2 FIELD MAPPING =======
+
+async function saveFieldMappingFromAdminPage() {
+  UI.log("Attempting to save field configuration from page...", "ls");
+  
+  // Try to find the configuration grid on the page
+  var grid = document.querySelector('table[role="table"], [role="grid"]');
+  if (!grid) {
+    UI.log("⚠ Could not find configuration grid on page", "lw");
+    return false;
+  }
+  
+  UI.log("✓ Found configuration grid", "ls");
+  
+  // Get all rows
+  var rows = Array.from(grid.querySelectorAll('tr, [role="row"]'));
+  UI.log("Found " + rows.length + " rows", "ls");
+  
+  if (rows.length < 2) {
+    UI.log("⚠ Grid has no data rows", "lw");
+    return false;
+  }
+  
+  // Parse the grid
+  var mapping = {
+    version: "1.0",
+    timestamp: new Date().toISOString(),
+    source: "DOM scrape from admin grid",
+    fields: {},
+    firmOrgLabels: {}
+  };
+  
+  var fieldCount = 0;
+  
+  // Skip header row (index 0) and section headers
+  for (var i = 1; i < rows.length; i++) {
+    var cells = Array.from(rows[i].querySelectorAll('td, th, [role="cell"]'));
+    
+    // Skip section header rows (they have fewer cells or different structure)
+    if (cells.length < 4) continue;
+    
+    var cellTexts = cells.map(function(c){ return c.innerText.trim(); });
+    
+    // Column structure from your output:
+    // [0] = drag handle
+    // [1] = Field Name (display name)
+    // [2] = Custom Label (if any)
+    // [3] = Field Type
+    // [4+] = other settings
+    
+    var displayName = cellTexts[1] || "";
+    var customLabel = cellTexts[2] || "";
+    var fieldType = cellTexts[3] || "";
+    
+    if (!displayName) continue;
+    
+    // The label to use (custom label if present, otherwise display name)
+    var label = customLabel || displayName;
+    
+    // We need to map display name to backend name
+    // For now, we'll use the display name as a key
+    // This isn't perfect but better than nothing
+    var backendName = displayName.toUpperCase().replace(/\s+/g, '');
+    
+    // Map common display names to known backend names
+    var displayNameMap = {
+      "OPPORTUNITYNAME": "VCHPROJECTNAME",
+      "CLIENTCOMPANY": "COMPANY",
+      "OWNERCOMPANY": "OWNERCOMPANY",
+      "OFFICE": "OFFICELIST",
+      "STUDIO": "STUDIOLIST",
+      "PRACTICEAREA": "PRACTICEAREALIST",
+      "DIVISION": "DIVISIONLIST",
+      "TERRITORY": "TERRITORYLIST",
+      "OFFICEDIVISION": "OFFICEDIVISIONLIST",
+      "OURFEE": "IFIRMFEE",
+      "WEIGHTEDVALUE": "IFACTOREDFEE",
+      "ESTPROJECTCOST": "ICOST"
+    };
+    
+    if (displayNameMap[backendName]) {
+      backendName = displayNameMap[backendName];
+    }
+    
+    mapping.fields[backendName] = {
+      label: label,
+      displayName: displayName,
+      type: fieldType.toLowerCase()
+    };
+    
+    // Track Firm Org labels
+    var firmOrgFields = ["OFFICELIST", "STUDIOLIST", "PRACTICEAREALIST", 
+                         "DIVISIONLIST", "TERRITORYLIST", "OFFICEDIVISIONLIST"];
+    if (firmOrgFields.includes(backendName)) {
+      mapping.firmOrgLabels[backendName] = label;
+      UI.log("  Firm Org: " + displayName + " → " + label, "ls");
+    }
+    
+    fieldCount++;
+  }
+  
+  if (fieldCount === 0) {
+    UI.log("⚠ No field data found in grid", "lw");
+    return false;
+  }
+  
+  localStorage.setItem('ExecIQ_FieldMapping_v1', JSON.stringify(mapping));
+  
+  UI.log("✅ Saved field mapping: " + fieldCount + " fields", "ls");
+  UI.log("✅ Firm Org labels: " + JSON.stringify(mapping.firmOrgLabels), "ls");
+  
+  return true;
+}
+
+// Check if we're on admin page and offer to save config
+async function checkAndOfferConfigSave() {
+  // Check if we're on the admin page
+  var isAdminPage = window.location.href.indexOf('/opportunity-administration-grid') > -1 ||
+                    window.location.href.indexOf('/admin') > -1;
+  
+  if (!isAdminPage) return false;
+  
+  // We're on admin page - always try to save/update config
+  UI.log("📍 Admin page detected!", "ls");
+  UI.log("💡 This page has access to field configuration", "ls");
+  UI.log("⚡ Saving field mapping for better labels...", "ls");
+  
+  var saved = await saveFieldMappingFromAdminPage();
+  
+  if (saved) {
+    UI.log("", "ls");
+    UI.log("✅ Field mapping saved successfully!", "ls");
+    
+    // Check if we have a recent mapping to show age
+    var stored = localStorage.getItem('ExecIQ_FieldMapping_v1');
+    if (stored) {
+      try {
+        var mapping = JSON.parse(stored);
+        UI.log("📊 " + Object.keys(mapping.fields).length + " fields configured", "ls");
+        UI.log("🏢 Firm Org labels: " + JSON.stringify(mapping.firmOrgLabels), "ls");
+      } catch(e) {}
+    }
+  }
+  
+  return saved;
+}
+
+// ======= END FIELD MAPPING SYSTEM =======
+
+// ======= v7.2 DATA-DRIVEN FIELD DISCOVERY =======
+var FIELD_CATALOG = null;
+
+async function discoverFieldsFromProbe(oppBase, fieldMapping) {
+  UI.log("Probing oppActions to discover available fields...", "ls");
+  
+  // Make a small probe request to see what fields are available
+  var probeBody = [
+    "action=getOpportunityGridData",
+    "json=1",
+    "sort=STAGEID",
+    "dir=ASC",
+    "selectedCurrency=USD",
+    "start=0",
+    "limit=1",
+    "view=0",
+    "ActiveInd=0",
+    "SalesCycle=NaN",
+    "officeId=0",
+    "divisionId=0",
+    "studioId=0",
+    "practiceAreaId=0",
+    "territoryId=0",
+    "stageId=0",
+    "priCatId=0",
+    "secCatId=0",
+    "masterSub=0",
+    "staffRoleId=0",
+    "dateCreated=0",
+    "dateModified=0",
+    "dateCreatedModified=0",
+    "filteredSearch=0",
+    "search="
+  ];
+  
+  // Add all standard columns
+  STANDARD_COLUMNS.forEach(function(c){
+    probeBody.push("visibleColumns=" + encodeURIComponent(c));
+  });
+  
+  try {
+    var response = await fetch(oppBase + "oppActions.cfm", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Requested-With": "XMLHttpRequest"
+      },
+      body: probeBody.join("&")
+    });
+    
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+    
+    var text = await response.text();
+    var startIdx = text.indexOf("{");
+    if (startIdx < 0) startIdx = text.indexOf("[");
+    if (startIdx < 0) throw new Error("No JSON found in response");
+    
+    var data = JSON.parse(text.slice(startIdx));
+    
+    // Handle different response formats
+    var columns = [];
+    if (data.COLUMNS && Array.isArray(data.COLUMNS)) {
+      columns = data.COLUMNS;
+    } else if (data.columns && Array.isArray(data.columns)) {
+      columns = data.columns;
+    } else if (Array.isArray(data.DATA) && data.DATA.length > 0) {
+      // CFC format - DATA is array of objects, get keys from first row
+      if (typeof data.DATA[0] === 'object' && !Array.isArray(data.DATA[0])) {
+        columns = Object.keys(data.DATA[0]);
+      }
+    }
+    
+    if (columns.length === 0) {
+      UI.log("Response keys: " + Object.keys(data).join(", "), "lw");
+      throw new Error("No columns found in response");
+    }
+    
+    UI.log("✓ Probe returned " + columns.length + " fields", "ls");
+    
+    // Build catalog from discovered columns
+    var catalog = {
+      backendFields: [],
+      compassMap: {},
+      labels: {},
+      types: {},
+      firmOrgFields: {}
+    };
+    
+    var currencyCount = 0;
+    var firmOrgCount = 0;
+    var customCount = 0;
+    
+    columns.forEach(function(backendName){
+      // Skip suppressed system fields
+      if (SUPPRESS.has(backendName.toUpperCase())) return;
+      
+      // Map backend to compass name
+      var compassName = BF[backendName] || BF[backendName.toUpperCase()];
+      
+      // Check if custom field (UUID pattern)
+      var isCustom = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(backendName);
+      
+      if (!compassName) {
+        if (isCustom) {
+          compassName = "CF_" + backendName.replace(/[^a-zA-Z0-9]/g, "_");
+          customCount++;
+        } else {
+          compassName = backendName;
+        }
+      }
+      
+      // Determine type and label
+      var type = "text";
+      var label = compassName;
+      
+      if (CF[compassName]) {
+        // Use known definition from CF (includes loaded custom fields)
+        type = CF[compassName].t;
+        label = CF[compassName].l;
+      } else if (fieldMapping && fieldMapping.fields[backendName]) {
+        // Use label from saved field mapping (from admin page)
+        label = fieldMapping.fields[backendName].label;
+        var mappedType = fieldMapping.fields[backendName].type;
+        if (mappedType.includes("currency") || mappedType.includes("money")) {
+          type = "currency";
+          currencyCount++;
+        } else if (mappedType.includes("percent")) {
+          type = "percent";
+        } else if (mappedType.includes("date")) {
+          type = "date";
+        } else if (mappedType.includes("number") || mappedType.includes("decimal")) {
+          type = "number";
+        }
+      } else {
+        // Infer from field name patterns
+        var upper = backendName.toUpperCase();
+        if (/^I.*FEE|^I.*COST|PRICE|AMOUNT|VALUE/i.test(upper)) {
+          type = "currency";
+          currencyCount++;
+        } else if (/PROBABILITY|PERCENT/i.test(upper)) {
+          type = "percent";
+        } else if (/^DT|DATE|TIME/i.test(upper)) {
+          type = "date";
+        } else if (/^I[A-Z]|COUNT|DAYS|NUMBER/i.test(upper)) {
+          type = "number";
+        }
+        
+        // Create friendly label from field name
+        if (backendName === backendName.toUpperCase()) {
+          // All caps - just title case it
+          label = backendName.charAt(0) + backendName.slice(1).toLowerCase();
+          label = label.replace(/_/g, ' ');
+        } else {
+          // Mixed case - add spaces before capitals
+          label = backendName.replace(/([A-Z])/g, ' $1').trim();
+        }
+        label = label.charAt(0).toUpperCase() + label.slice(1);
+      }
+      
+      // Override Firm Org labels if we have them from mapping
+      var firmOrgPatterns = ["OFFICELIST", "STUDIOLIST", "PRACTICEAREALIST", "DIVISIONLIST", "TERRITORYLIST", "OFFICEDIVISIONLIST"];
+      if (firmOrgPatterns.includes(backendName.toUpperCase())) {
+        if (fieldMapping && fieldMapping.firmOrgLabels[backendName.toUpperCase()]) {
+          label = fieldMapping.firmOrgLabels[backendName.toUpperCase()];
+        }
+      }
+      
+      // Apply user-defined label overrides (highest priority)
+      if (USER_LABEL_OVERRIDES[backendName] || USER_LABEL_OVERRIDES[backendName.toUpperCase()]) {
+        label = USER_LABEL_OVERRIDES[backendName] || USER_LABEL_OVERRIDES[backendName.toUpperCase()];
+      }
+      
+      // Add to catalog
+      catalog.backendFields.push(backendName);
+      catalog.compassMap[backendName] = compassName;
+      catalog.labels[compassName] = label;
+      catalog.types[compassName] = type;
+      
+      // Update CF for compatibility
+      if (!CF[compassName]) {
+        CF[compassName] = {l: label, t: type, e: 1};
+      }
+      
+      // Check if Firm Org field
+      var firmOrgPatterns = ["OFFICELIST", "STUDIOLIST", "PRACTICEAREALIST", "DIVISIONLIST", "TERRITORYLIST", "OFFICEDIVISIONLIST"];
+      if (firmOrgPatterns.includes(backendName.toUpperCase())) {
+        catalog.firmOrgFields[compassName] = {
+          backendField: backendName,
+          label: label,
+          compassName: compassName
+        };
+        
+        if (FIRM_ORG_FIELDS[compassName]) {
+          FIRM_ORG_FIELDS[compassName].displayLabel = label;
+        }
+        
+        firmOrgCount++;
+      }
+    });
+    
+    UI.log("✓ Built catalog: " + catalog.backendFields.length + " fields", "ls");
+    if (currencyCount > 0) UI.log("  - " + currencyCount + " inferred currency fields", "ls");
+    if (firmOrgCount > 0) UI.log("  - " + firmOrgCount + " firm org fields", "ls");
+    if (customCount > 0) UI.log("  - " + customCount + " custom fields", "ls");
+    
+    return catalog;
+    
+  } catch(e) {
+    UI.log("⚠ Probe failed: " + e.message, "le");
+    return null;
+  }
+}
+// ======= END v7.2 DATA-DRIVEN DISCOVERY =======
+
+
 // Firm Org Discovery Engine
 function discoverFirmOrgs(rows){
   var usage = {};
@@ -81,7 +557,7 @@ function discoverFirmOrgs(rows){
   Object.keys(FIRM_ORG_FIELDS).forEach(function(field){
     usage[field] = {
       field: field,
-      label: CF[field] ? CF[field].l : FIRM_ORG_FIELDS[field].defaultLabel,
+      label: FIRM_ORG_FIELDS[field].displayLabel || (CF[field] ? CF[field].l : field),
       count: 0,
       sampleValues: [],
       enabled: false,
@@ -176,7 +652,7 @@ var ConfigUI = (function(){
     
     modalEl.innerHTML = 
       '<div id="iqcfg-hd">' +
-        '<h2>ExecIQ v7.0 Configuration</h2>' +
+        '<h2>ExecIQ v7.2 Configuration</h2>' +
         '<p>Configure your analysis dimensions and reporting preferences</p>' +
       '</div>' +
       '<div id="iqcfg-bd">' +
@@ -326,7 +802,7 @@ var UI = (function(){
     document.head.appendChild(s);
     var el = document.createElement("div");
     el.id = "iq7";
-    el.innerHTML = '<div id="iq7-hd"><div id="iq7-logo">IQ</div><div id="iq7-ttl"><h3>ExecIQ Extractor <span style="font-weight:400;font-size:10px;color:#8b949e">v7.0</span></h3><small>Unanet CRM — Advanced Analytics Suite</small></div><div id="iq7-acts"><button id="iq7-settings">⚙️ Settings</button><button id="iq7-x">×</button></div></div><div id="iq7-bd"><div id="iq7-kpis"><div class="iq7-kpi"><div class="iq7-kv" id="kv-o">--</div><div class="iq7-kl">Opportunities</div></div><div class="iq7-kpi"><div class="iq7-kv" id="kv-f">--</div><div class="iq7-kl">Fields</div></div><div class="iq7-kpi"><div class="iq7-kv" id="kv-r">0</div><div class="iq7-kl">Lookups</div></div></div><div id="iq7-st"><span class="ok">Starting...</span></div><div id="iq7-prog"><div id="iq7-fill"></div></div><div id="iq7-log"></div><button id="iq7-btn" disabled>Export Excel Report</button></div>';
+    el.innerHTML = '<div id="iq7-hd"><div id="iq7-logo">IQ</div><div id="iq7-ttl"><h3>ExecIQ Extractor <span style="font-weight:400;font-size:10px;color:#8b949e">v7.2</span></h3><small>Unanet CRM — Advanced Analytics Suite</small></div><div id="iq7-acts"><button id="iq7-settings">⚙️ Settings</button><button id="iq7-x">×</button></div></div><div id="iq7-bd"><div id="iq7-kpis"><div class="iq7-kpi"><div class="iq7-kv" id="kv-o">--</div><div class="iq7-kl">Opportunities</div></div><div class="iq7-kpi"><div class="iq7-kv" id="kv-f">--</div><div class="iq7-kl">Fields</div></div><div class="iq7-kpi"><div class="iq7-kv" id="kv-r">0</div><div class="iq7-kl">Lookups</div></div></div><div id="iq7-st"><span class="ok">Starting...</span></div><div id="iq7-prog"><div id="iq7-fill"></div></div><div id="iq7-log"></div><button id="iq7-btn" disabled>Export Excel Report</button></div>';
     document.body.appendChild(el);
     elSt = document.getElementById("iq7-st");
     elFill = document.getElementById("iq7-fill");
@@ -454,6 +930,23 @@ function fmtDate(val){
   }
   if (!d || isNaN(d.getTime()))return "";
   return String(d.getMonth()+ 1).padStart(2,"0")+ "/" + String(d.getDate()).padStart(2,"0")+ "/" + d.getFullYear();
+}
+
+function parseExcelDate(val){
+  if (!val || val === "")return "";
+  var s = String(val).trim();
+  var d;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s))d = new Date(s);
+  else{
+    var m = s.match(/^(\w+),\s*(\d+)\s+(\d{4})/);
+    if (!m)return "";
+    d = new Date(m[1]+ " " + m[2]+ "," + m[3]);
+  }
+  if (!d || isNaN(d.getTime()))return "";
+  // Convert to Excel serial date (days since 1900-01-01)
+  var epoch = new Date(Date.UTC(1899, 11, 30)); // Excel's epoch
+  var days = (d - epoch) / (24 * 60 * 60 * 1000);
+  return days;
 }
 
 function stripHTML(str){
@@ -584,10 +1077,24 @@ function buildOppSheet(rows,cols){
       var addr = XLSX.utils.encode_cell({r:ri + 1,c:ci });
       if (c.type === "currency")applyFmt(ws,addr,'"$"#,##0');
       else if (c.type === "percent")applyFmt(ws,addr,"0%");
+      else if (c.type === "date")applyFmt(ws,addr,"mm/dd/yyyy");
     });
   });
   ws["!autofilter"]={ref:"A1:" + XLSX.utils.encode_col(hdrs.length - 1)+ "1" };
   ws["!cols"]= hdrs.map(function(h){return{wch:Math.max(10,Math.min(40,String(h).length + 4))};});
+  
+  // Apply professional styling to header row
+  var headerRange = XLSX.utils.decode_range(ws['!ref']);
+  for (var C = headerRange.s.c; C <= headerRange.e.c; ++C) {
+    var addr = XLSX.utils.encode_cell({r:0, c:C});
+    if (!ws[addr]) continue;
+    ws[addr].s = {
+      font: { bold: true, color: { rgb: "FFFFFF" } },
+      fill: { fgColor: { rgb: "4472C4" } },
+      alignment: { horizontal: "center", vertical: "center" }
+    };
+  }
+  
   return ws;
 }
 
@@ -1086,6 +1593,7 @@ async function main(){
   // Check for existing config
   userConfig = ConfigManager.load();
   
+  // Look for oppActions on grid page
   UI.status("Finding oppActions.cfm...");
   var oppBase = await findOppBase();
   if (!oppBase){
@@ -1118,8 +1626,30 @@ async function main(){
   UI.log("lookupBase: " + (lookupBase ? "found":"NOT FOUND"),lookupBase ? "ls":"lw");
   UI.prog(18);
   
+  // Load saved field mapping if available (from admin page setup)
+  var fieldMapping = await loadFieldMapping();
+  
+  // Load custom field definitions FIRST so catalog can use real labels
   UI.status("Loading custom field definitions...");
   var customUUIDs = await loadCustomFields(customFieldsURL);
+  UI.prog(25);
+  
+  // v7.2: Discover fields by probing oppActions response
+  UI.status("Discovering available fields...");
+  FIELD_CATALOG = await discoverFieldsFromProbe(oppBase, fieldMapping);
+  
+  var allColumns;
+  if (FIELD_CATALOG) {
+    // Use discovered fields
+    allColumns = FIELD_CATALOG.backendFields;
+    UI.log("✓ Using " + allColumns.length + " discovered fields", "ls");
+  } else {
+    // Fallback: use standard + custom
+    UI.log("⚠ Using fallback field discovery", "lw");
+    allColumns = STANDARD_COLUMNS.concat(customUUIDs);
+  }
+  
+  UI.kpi("kv-f", allColumns.length);
   UI.prog(30);
   
   UI.status("Loading lookup tables...");
@@ -1176,8 +1706,7 @@ async function main(){
   }
   UI.prog(45);
   
-  var allColumns = STANDARD_COLUMNS.concat(customUUIDs);
-  UI.log("Requesting " + allColumns.length + " fields (" + customUUIDs.length + " custom)","ls");
+  UI.log("Requesting " + allColumns.length + " fields","ls");
   
   UI.status("Fetching opportunities...");
   var bodyParts =["action=getOpportunityGridData","json=1","sort=STAGEID","dir=ASC","selectedCurrency=USD","start=0","limit=9999","view=0","ActiveInd=0","SalesCycle=NaN","officeId=0","divisionId=0","studioId=0","practiceAreaId=0","territoryId=0","stageId=0","priCatId=0","secCatId=0","masterSub=0","staffRoleId=0","dateCreated=0","dateModified=0","dateCreatedModified=0","filteredSearch=0","search=" ];
@@ -1232,10 +1761,29 @@ async function main(){
       if (SUPPRESS.has(bf))return;
       var val = opp[bf];
       if (val === null || val === undefined || val === "")return;
-      var compassKey = BF[bf]|| BF[bf.toUpperCase()]|| BF[bf.toLowerCase()];
+      
+      // Use FIELD_CATALOG if available, otherwise fall back to BF mapping
+      var compassKey;
+      if (FIELD_CATALOG && FIELD_CATALOG.compassMap[bf]) {
+        compassKey = FIELD_CATALOG.compassMap[bf];
+      } else {
+        compassKey = BF[bf]|| BF[bf.toUpperCase()]|| BF[bf.toLowerCase()];
+      }
+      
       if (!compassKey)return;
       if (["OpportunityNumber","OpportunityName","ClientCompany","OwnerCompany","Stage","OpportunityStatus","FirmEstimatedFee","FactoredFee","WinProbability"].includes(compassKey))return;
-      var cfg = CF[compassKey];
+      
+      // Get field config from catalog or CF
+      var cfg;
+      if (FIELD_CATALOG && FIELD_CATALOG.types[compassKey]) {
+        cfg = {
+          t: FIELD_CATALOG.types[compassKey],
+          l: FIELD_CATALOG.labels[compassKey]
+        };
+      } else {
+        cfg = CF[compassKey];
+      }
+      
       if (!cfg)return;
       var type = cfg.t;
       var display;
@@ -1270,7 +1818,8 @@ async function main(){
       }else if (compassKey === "RFPReceived"){
         display = String(val)=== "1" ? "Yes":String(val)=== "0" ? "No":String(val);
       }else if (type === "date"){
-        display = fmtDate(val);
+        // Keep as Excel date number for sorting/filtering
+        display = parseExcelDate(val);
       }else if (type === "currency"){
         display = parseFloat(val)|| 0;
       }else if (type === "percent"){
@@ -1286,12 +1835,92 @@ async function main(){
     return row;
   });
   
+  // Build active columns list
+  // Only include fields that: (1) have data in at least one row, (2) are not all zeros, (3) are properly resolved
   var activeCols = [];
-  KEY_ORDER.forEach(function(ck){
-    if (seenCompass[ck]&& CF[ck])activeCols.push({key:ck,label:CF[ck].l,type:CF[ck].t });
+  var fieldStats = {};
+  
+  // Calculate stats for each field
+  cleanRows.forEach(function(row){
+    Object.keys(row).forEach(function(key){
+      if (key.startsWith('_')) return; // Skip internal fields
+      if (!fieldStats[key]) fieldStats[key] = {count: 0, hasNonZero: false, values: [], hasUnresolvedIDs: false};
+      var val = row[key];
+      if (val !== null && val !== undefined && val !== "") {
+        fieldStats[key].count++;
+        if (typeof val === 'number' && val !== 0) fieldStats[key].hasNonZero = true;
+        if (fieldStats[key].values.length < 3) fieldStats[key].values.push(val);
+        
+        // Check if value looks like unresolved IDs (all numeric)
+        var strVal = String(val);
+        if (/^\d+$/.test(strVal) && strVal.length < 6) {
+          // Might be an ID - check if it's a known ID field that should be numeric
+          var numericFields = ['OpportunityNumber', 'DaysinStage'];
+          if (!numericFields.includes(key)) {
+            fieldStats[key].hasUnresolvedIDs = true;
+          }
+        }
+      }
+    });
   });
-  Object.keys(CF).forEach(function(ck){
-    if (!KEY_ORDER.includes(ck)&& seenCompass[ck])activeCols.push({key:ck,label:CF[ck].l,type:CF[ck].t });
+  
+  // Fields to explicitly exclude (known problematic fields)
+  var excludeFields = ['OfficeDivision']; // Can't resolve without proper lookup data
+  
+  // Add fields with data to activeCols
+  // Priority 1: KEY_ORDER fields (always include if they have any data)
+  KEY_ORDER.forEach(function(ck){
+    if (excludeFields.includes(ck)) return; // Skip excluded fields
+    if (seenCompass[ck] && fieldStats[ck] && fieldStats[ck].count > 0) {
+      // Skip if all values are unresolved IDs
+      if (fieldStats[ck].hasUnresolvedIDs && fieldStats[ck].count === fieldStats[ck].values.filter(function(v){ return /^\d+$/.test(String(v)); }).length) {
+        return; // All values look like unresolved IDs
+      }
+      
+      var label, type;
+      if (FIELD_CATALOG && FIELD_CATALOG.labels[ck]) {
+        label = FIELD_CATALOG.labels[ck];
+        type = FIELD_CATALOG.types[ck];
+      } else if (CF[ck]) {
+        label = CF[ck].l;
+        type = CF[ck].t;
+      } else {
+        label = ck;
+        type = "text";
+      }
+      activeCols.push({key: ck, label: label, type: type});
+    }
+  });
+  
+  // Priority 2: All other fields that have data and are not all zeros
+  Object.keys(seenCompass).forEach(function(ck){
+    if (excludeFields.includes(ck)) return; // Skip excluded fields
+    if (KEY_ORDER.includes(ck)) return; // Already added
+    if (!fieldStats[ck] || fieldStats[ck].count === 0) return; // No data
+    
+    // Skip if all values are unresolved IDs
+    if (fieldStats[ck].hasUnresolvedIDs && fieldStats[ck].count === fieldStats[ck].values.filter(function(v){ return /^\d+$/.test(String(v)); }).length) {
+      return;
+    }
+    
+    // Skip fields that are all zeros (likely just structure)
+    if (fieldStats[ck].count > 0 && !fieldStats[ck].hasNonZero) {
+      var allZeros = fieldStats[ck].values.every(function(v){ return v === 0 || v === "0"; });
+      if (allZeros) return;
+    }
+    
+    var label, type;
+    if (FIELD_CATALOG && FIELD_CATALOG.labels[ck]) {
+      label = FIELD_CATALOG.labels[ck];
+      type = FIELD_CATALOG.types[ck];
+    } else if (CF[ck]) {
+      label = CF[ck].l;
+      type = CF[ck].t;
+    } else {
+      label = ck;
+      type = "text";
+    }
+    activeCols.push({key: ck, label: label, type: type});
   });
   
   UI.kpi("kv-f",activeCols.length);
@@ -1441,4 +2070,4 @@ async function main(){
 }
 
 main();
-})();
+})()
