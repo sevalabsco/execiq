@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.2";
+var VERSION = "3.3";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -323,18 +323,33 @@ function resolveIDs(val, map){
 
 function fmtDate(val){
   // Returns a real Date object so SheetJS writes a proper Excel date serial number.
-  // The sheet builder applies mm/dd/yyyy format to date cells.
-  // Returning a string would write text that Excel cannot sort or filter as a date.
+  // Handles all date formats observed in Unanet CRM responses:
+  //   MM/DD/YYYY         — custom fields, some standard fields
+  //   YYYY-MM-DD[T...]   — ISO format, datetime stamps
+  //   Month, DD YYYY ... — ColdFusion default date format
   if(!val||val==="") return null;
-  var s=String(val).trim(), d;
-  if(/^\d{4}-\d{2}-\d{2}/.test(s)){
-    // ISO format — parse as local date to avoid UTC offset shifting the day
-    var parts = s.slice(0,10).split("-");
+  var s=String(val).trim(), d, parts, m;
+
+  // MM/DD/YYYY or M/D/YYYY  (custom fields return this format)
+  if(/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)){
+    parts = s.slice(0,10).split("/");
+    d = new Date(parseInt(parts[2]), parseInt(parts[0])-1, parseInt(parts[1]));
+  }
+  // YYYY-MM-DD (ISO — standard fields, datetime stamps)
+  else if(/^\d{4}-\d{2}-\d{2}/.test(s)){
+    parts = s.slice(0,10).split("-");
     d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
-  } else {
-    var m=s.match(/^(\w+),\s*(\d+)\s+(\d{4})/);
-    if(!m) return null;
-    d=new Date(m[1]+" "+m[2]+","+m[3]);
+  }
+  // Month, DD YYYY HH:MM:SS (ColdFusion default: "May, 04 2026 00:00:00")
+  else if((m=s.match(/^(\w+),\s*(\d+)\s+(\d{4})/))){
+    d = new Date(m[1]+" "+m[2]+","+m[3]);
+  }
+  // DD-Mon-YYYY ("04-May-2026") — occasionally seen
+  else if((m=s.match(/^(\d{1,2})-(\w{3})-(\d{4})/))){
+    d = new Date(m[2]+" "+m[1]+","+m[3]);
+  }
+  else {
+    return null;
   }
   if(!d||isNaN(d.getTime())) return null;
   return d;
@@ -780,14 +795,14 @@ function buildFieldSchema(availableFields, config){
 
   // ── Custom fields (UUID keys) ─────────────────────────────────
   // Source of truth: customFieldConfigs from firmData.cfc.
-  // We do NOT rely on the probe to discover custom fields — a custom field
-  // with no value on the probe record would appear absent and be wrongly skipped.
-  // All custom fields from customFieldConfigs are always included in the schema.
-  // Their UUIDs are always added to the full fetch visibleColumns list.
+  // ALL custom fields are included in schema regardless of whether
+  // the server returned data for them. If the server doesn't return
+  // a UUID (Unanet limitation on certain LEAD slot mappings), the
+  // column will exist but be empty — which is correct behaviour.
   config.customFields.forEach(function(cf){
     var uuidLower = cf.uuid.toLowerCase().trim();
     schema.push({
-      backendKey: uuidLower,   // always lowercase — server requires raw UUID format
+      backendKey: uuidLower,
       upper:      "CUSTOM_" + cf.label.toUpperCase().replace(/[^A-Z0-9]/g,"_"),
       label:      cf.label,
       type:       cf.type,
@@ -1119,6 +1134,20 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
     UI.log("⚠ ROWCOUNT=" + reported + " but received=" + received, "lw");
   }
   UI.log("✓ " + received + " of " + reported + " opportunities received", "ls");
+
+  // Log any custom field UUIDs that the server did not return
+  // This is a Unanet limitation — certain LEAD slot mappings are not
+  // exposed via the grid endpoint regardless of enabled/GridEnabled state
+  var returnedKeys = new Set();
+  if(data.DATA && data.DATA.length > 0){
+    Object.keys(data.DATA[0]).forEach(function(k){ returnedKeys.add(k.toLowerCase()); });
+  }
+  customFieldUUIDs.forEach(function(uuid){
+    if(!returnedKeys.has(uuid.toLowerCase())){
+      UI.log("  ℹ Server did not return UUID: ..."+uuid.slice(-8)+" (Unanet slot limitation — column will be empty)", "lw");
+    }
+  });
+
   return data;
 }
 
@@ -1572,6 +1601,11 @@ function buildOpportunitySheet(rows, schema){
     Object.keys(row).forEach(function(k){
       if(!k.startsWith("__")) seenLabels[k]=1;
     });
+  });
+  // Always include custom field labels even if no records have data for them
+  // (server may not return certain UUIDs but column should still exist)
+  schema.forEach(function(f){
+    if(f.isCustom && f.label) seenLabels[f.label] = 1;
   });
 
   // Final ordered column list — only labels that have data
