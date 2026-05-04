@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.3";
+var VERSION = "3.4";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -291,13 +291,16 @@ function parseCFC(data){
   if(!data) return [];
   if(data.response) data=data.response;
   if(data.Response) data=data.Response;
-  if(Array.isArray(data.COLUMNS) && Array.isArray(data.DATA)){
-    return data.DATA.map(function(row){
+  // Handle both uppercase COLUMNS/DATA and lowercase columns/data (role.cfc variant)
+  var cols = data.COLUMNS || data.columns;
+  var rows = data.DATA    || data.data;
+  if(Array.isArray(cols) && Array.isArray(rows)){
+    return rows.map(function(row){
       if(!Array.isArray(row)) return row;
-      var o={}; data.COLUMNS.forEach(function(c,i){o[c]=row[i];}); return o;
+      var o={}; cols.forEach(function(c,i){o[c]=row[i];}); return o;
     });
   }
-  if(Array.isArray(data.DATA)) return data.DATA;
+  if(Array.isArray(rows)) return rows;
   if(Array.isArray(data)) return data;
   return [];
 }
@@ -305,8 +308,19 @@ function parseCFC(data){
 function buildLookup(records, idField, nameField){
   var map={};
   records.forEach(function(r){
-    var id   = String(r[idField]||r.ID||r.id||"").trim();
-    var name = String(r[nameField]||r.NAME||r.name||r.LABEL||r.label||r.DISPLAYNAME||"").trim();
+    // Try provided field names first, then common fallbacks
+    var id = String(
+      r[idField] || r[idField.toLowerCase()] ||
+      r.ID || r.id || r.STAGEID || r.ROLEID || r.CATEGORYID ||
+      r.STAFFROLEID || ""
+    ).trim();
+    var name = String(
+      r[nameField] || r[nameField.toLowerCase()] ||
+      r.NAME || r.name || r.LABEL || r.label ||
+      r.DISPLAYNAME || r.displayName ||
+      r.STAGENAME || r.ROLENAME || r.CATEGORYNAME ||
+      r.STAFFROLENAME || r.TYPENAME || r.VALUE || r.value || ""
+    ).trim();
     if(id && id!=="0" && name) map[id]=name;
   });
   return map;
@@ -615,14 +629,17 @@ async function buildClientConfig(firmDataBase){
 
     // Map FieldType to our internal type system
     // FieldType values: Date, NumberCurrency, NumberInteger, NumberDecimal,
-    //                   NumberPercent, ShortText, LongText, ValueList
+    //                   NumberPercent, ShortText, LongText, ValueList,
+    //                   SelectSingle, SelectMultiple, TextHyperlink, TextRich
     var rawType = String(cf.FieldType || cf.fieldType || cf.CustomFieldTypeName || "text").toLowerCase();
     var type = rawType.includes("currency") || rawType.includes("money") ? "currency"
              : rawType.includes("percent")                               ? "percent"
              : rawType.includes("date")                                  ? "date"
              : rawType.includes("number") || rawType.includes("decimal") ||
                rawType.includes("integer")                               ? "number"
-             : rawType.includes("longtext") || rawType.includes("long")  ? "longtext"
+             : rawType.includes("longtext") || rawType.includes("long") ||
+               rawType.includes("rich")                                  ? "longtext"
+             : rawType.includes("selectsingle") || rawType.includes("select") ? "select"
              : "text";
 
     config.customFields.push({uuid:uuid, label:label, type:type});
@@ -643,6 +660,53 @@ async function buildClientConfig(firmDataBase){
     });
   });
   UI.log("✓ Firm Org lookup: " + Object.keys(config.lookups.firmOrg).length + " entries", "ls");
+
+  // ── Pre-seed lookups from firmData where available ────────────
+  // These serve as fallbacks when .cfc endpoints return 404 on some instances.
+  // opportunityContactRoles = role lookup (Prime/Sub/JV)
+  var ocr = parseCFC(fd.opportunityContactRoles || {});
+  if(ocr.length){
+    ocr.forEach(function(r){
+      var id=String(r.ROLEID||r.roleid||"").trim();
+      var name=String(r.ROLENAME||r.rolename||"").trim();
+      if(id&&name) config.lookups.roleFromFirmData = config.lookups.roleFromFirmData||{};
+      if(id&&name) config.lookups.roleFromFirmData[id]=name;
+    });
+  }
+
+  // staffRoles in firmData (some instances expose this here too)
+  var fsr = parseCFC(fd.staffRoles || {});
+  if(fsr.length){
+    config.lookups.staffRolesFromFirmData = {};
+    fsr.forEach(function(r){
+      var id=String(r.STAFFROLEID||r.staffroleid||"").trim();
+      var name=String(r.STAFFROLENAME||r.staffrolename||"").trim();
+      if(id&&name) config.lookups.staffRolesFromFirmData[id]=name;
+    });
+    UI.log("✓ Staff roles from firmData: " + Object.keys(config.lookups.staffRolesFromFirmData).length, "ls");
+  }
+
+  // ── Build SelectSingle custom field value maps ────────────────
+  // customFieldConfigs with FieldType=SelectSingle contain SelectValues:
+  // [{Key: uuid, Value: displayName}] — build lookup map per field UUID
+  config.lookups.customSelectValues = {};
+  var cfArr2 = Array.isArray(fd.customFieldConfigs) ? fd.customFieldConfigs : [];
+  cfArr2.forEach(function(cf){
+    var uuid = String(cf.DefinitionId||"").trim().toLowerCase();
+    var sv = Array.isArray(cf.SelectValues) ? cf.SelectValues : [];
+    if(uuid && sv.length){
+      var map = {};
+      sv.forEach(function(item){
+        var k = String(item.Key||item.key||"").trim().toLowerCase();
+        var v = String(item.Value||item.value||"").trim();
+        if(k&&v) map[k]=v;
+      });
+      if(Object.keys(map).length) config.lookups.customSelectValues[uuid] = map;
+    }
+  });
+  if(Object.keys(config.lookups.customSelectValues).length){
+    UI.log("✓ Custom select value maps: " + Object.keys(config.lookups.customSelectValues).length, "ls");
+  }
 
   return config;
 }
@@ -691,28 +755,49 @@ async function loadLookupTables(oppBase, config){
     getLookup("staffTeam.cfc",      "getStaffTeamRoles"),  // staff role ID → name
   ]);
 
-  // Merge both stage method variants
-  var stageRaw = parseCFC(results[0] || results[1]);
-  config.lookups.stage      = buildLookup(stageRaw,        "STAGEID",          "STAGENAME");
+  // Merge both stage method variants — use whichever returned JSON
+  function pickJSON(a, b){
+    var ar=parseCFC(a), br=parseCFC(b);
+    return ar.length ? ar : br;
+  }
+  config.lookups.stage      = buildLookup(pickJSON(results[0],results[1]), "STAGEID",           "STAGENAME");
+  config.lookups.prospect   = buildLookup(parseCFC(results[2]),            "ID",                "DISPLAYNAME");
 
-  config.lookups.prospect   = buildLookup(parseCFC(results[2]), "ID",           "DISPLAYNAME");
-
-  var roleRaw = parseCFC(results[3] || results[4]);
-  config.lookups.role       = buildLookup(roleRaw,          "ROLEID",           "ROLENAME");
+  // role.cfc returns {data:[{roleid,rolename}]} — parseCFC now handles lowercase
+  var roleRaw = pickJSON(results[3], results[4]);
+  config.lookups.role = buildLookup(roleRaw, "ROLEID", "ROLENAME");
+  // Merge firmData role fallback if .cfc returned nothing
+  if(!Object.keys(config.lookups.role).length && config.lookups.roleFromFirmData){
+    config.lookups.role = config.lookups.roleFromFirmData;
+    UI.log("  Role lookup: using firmData fallback", "lw");
+  }
 
   config.lookups.contract   = buildLookup(parseCFC(results[5]), "CONTRACTTYPEID","CONTRACTNAME");
   config.lookups.delivery   = buildLookup(parseCFC(results[6]), "DELIVERYMETHODID","DELIVERYMETHODNAME");
-  config.lookups.clientType = buildLookup(parseCFC(results[7]), "ID",            "DISPLAYNAME");
+  config.lookups.clientType = buildLookup(parseCFC(results[7]), "ID",             "DISPLAYNAME");
   config.lookups.submittal  = buildLookup(parseCFC(results[8]), "SUBMITTALTYPEID","SUBMITTALTYPENAME");
-  config.lookups.priCat     = buildLookup(parseCFC(results[9]), "CATEGORYID",    "CATEGORYNAME");
-  config.lookups.secCat     = buildLookup(parseCFC(results[10]),"CATEGORYID",    "CATEGORYNAME");
 
-  // Staff role ID → role name (e.g. "253241" → "BD Lead")
+  // Primary/Secondary categories — getList returns HTML on some instances, try getJSON
+  config.lookups.priCat = buildLookup(parseCFC(results[9]),  "CATEGORYID", "CATEGORYNAME");
+  config.lookups.secCat = buildLookup(parseCFC(results[10]), "CATEGORYID", "CATEGORYNAME");
+  // If categories came back empty (HTML response), log and continue — IDs will show as-is
+  if(!Object.keys(config.lookups.priCat).length){
+    UI.log("  Primary category lookup empty — IDs will show raw (no JSON endpoint found)", "lw");
+  }
+
+  // Staff role ID → role name
   var staffRoleRaw = parseCFC(results[11]);
   config.lookups.staffRoles = buildLookup(staffRoleRaw, "STAFFROLEID", "STAFFROLENAME");
+  // Merge firmData staff roles fallback
+  if(!Object.keys(config.lookups.staffRoles).length && config.lookups.staffRolesFromFirmData){
+    config.lookups.staffRoles = config.lookups.staffRolesFromFirmData;
+    UI.log("  Staff roles: using firmData fallback", "lw");
+  }
   UI.log("✓ Staff roles: " + Object.keys(config.lookups.staffRoles).length, "ls");
 
-  var total = Object.values(config.lookups).reduce(function(t,m){ return t+Object.keys(m).length; },0);
+  var total = Object.values(config.lookups).reduce(function(t,m){
+    return t + (m && typeof m==="object" && !Array.isArray(m) ? Object.keys(m).length : 0);
+  }, 0);
   UI.log("✓ Total lookup entries: " + total, "ls");
   return config;
 }
@@ -893,12 +978,16 @@ function isFieldEnabled(upper, backendKey, enabledLower){
 
   // 3. Strip common suffixes and check
   var strippedSuffixes = [
-    lower.replace(/list$/,""),    // OFFICELIST → office(id) — check officeid below
-    lower.replace(/list$/,"id"),  // OFFICELIST → officeid
-    lower.replace(/name$/,""),    // STAGENAME → stage
-    lower.replace(/name$/,"id"),  // STAGENAME → stageid (won't match but harmless)
-    lower.replace(/date$/,""),    // CLOSEDATE → close (unlikely but safe)
+    lower.replace(/list$/,""),      // OFFICELIST → office
+    lower.replace(/list$/,"id"),    // OFFICELIST → officeid
+    lower.replace(/name$/,""),      // STAGENAME → stage
+    lower.replace(/name$/,"id"),    // STAGENAME → stageid
+    lower.replace(/date$/,""),      // CLOSEDATE → close
+    lower.replace(/date$/,""),      // ESTIMATEDCOMPLETIONDATE → estimatedcompletion
   ];
+  // Also try removing 'estimated' prefix for eststartdate/estcompletiondate variants
+  var estStripped = lower.replace(/^estimated/,"est").replace(/^estimated/,"");
+  if(estStripped && estStripped !== lower) strippedSuffixes.push(estStripped);
   for(var j=0; j<strippedSuffixes.length; j++){
     if(strippedSuffixes[j] && strippedSuffixes[j] !== lower && enabledLower.has(strippedSuffixes[j])){
       return true;
@@ -913,6 +1002,43 @@ function isFieldEnabled(upper, backendKey, enabledLower){
     .replace(/list$/,"")
     .replace(/name$/,"");
   if(core && core !== lower && enabledLower.has(core)) return true;
+
+  // 5. Known field mappings that don't fit the pattern rules above
+  var KNOWN_MAPPINGS = {
+    "estimatedstartdate":      "eststartdate",
+    "estimatedcompletiondate": "estcompletiondate",
+    "primarycategorylist":     "projectcategoryid",
+    "secondarycategorylist":   "secondarycategoryid",
+    "practicearealist":        "practiceareaid",
+    "studiolist":              "studioid",
+    "officelist":              "officeid",
+    "territorylist":           "territoryid",
+    "divisionlist":            "divisionid",
+    "contracttypes":           "contracttype",
+    "clienttypes":             "clienttypeid",
+    "prospecttypes":           "prospecttypes",
+    "servicetypes":            "servicetypeid",
+    "naicscodes":              "naicscode",
+    "txcomments":              "txcomments",
+    "txnote":                  "notes",
+    "vchnextaction":           "nextaction",
+    "vchaddress1":             "address1",
+    "vchaddress2":             "address2",
+    "vchcity":                 "city",
+    "stateabrv":               "state",
+    "vchpostalcode":           "postalcode",
+    "vchcountry":              "country",
+    "rolename":                "roleid",
+    "submittaltypename":       "submittaltype",
+    "chrfprec":                "chrfprec",
+    "chproposalsub":           "proposalsubmitted",
+    "solicitationnumber":      "solicitationnumber",
+    "daysinstage":             "daysinstage",
+    "createdate":              "leadnumber",   // always include
+    "moddate":                 "leadnumber",   // always include
+  };
+  var mapped = KNOWN_MAPPINGS[lower];
+  if(mapped && enabledLower.has(mapped)) return true;
 
   return false;
 }
@@ -1192,11 +1318,25 @@ function normalizeRecord(opp, schema, config){
 
     // Custom field — UUID key may be returned in different case by server
     if(field.isCustom){
-      if(field.type==="date")          display = fmtDate(val);
-      else if(field.type==="currency") display = parseFloat(val)||0;
-      else if(field.type==="percent")  display = (parseFloat(val)||0)/100;
-      else if(field.type==="number")   display = parseFloat(val)||0;
-      else                             display = String(val).trim();
+      if(field.type==="date"){
+        display = fmtDate(val);
+      } else if(field.type==="currency"){
+        display = parseFloat(val)||0;
+      } else if(field.type==="percent"){
+        display = (parseFloat(val)||0)/100;
+      } else if(field.type==="number"){
+        display = parseFloat(val)||0;
+      } else if(field.type==="select"){
+        // SelectSingle — val is a UUID key, resolve to display value
+        var selectMap = (config.lookups.customSelectValues||{})[field.backendKey.toLowerCase()];
+        if(selectMap){
+          display = selectMap[String(val).trim().toLowerCase()] || String(val).trim();
+        } else {
+          display = String(val).trim();
+        }
+      } else {
+        display = String(val).trim();
+      }
       // Store even if empty string so the column appears — only skip null/undefined
       if(display!==null&&display!==undefined) row[field.label] = display;
       return;
