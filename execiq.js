@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.7";
+var VERSION = "3.8";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -1394,6 +1394,10 @@ function normalizeRecord(opp, schema, config){
       } else {
         display = String(val).trim();
       }
+      // Truncate long text — Excel hard limit is 32,767 chars per cell
+      if(display && typeof display === "string" && display.length > 2000){
+        display = display.slice(0, 2000) + "…";
+      }
       // Store even if empty string so the column appears — only skip null/undefined
       if(display!==null&&display!==undefined) row[field.label] = display;
       return;
@@ -1423,6 +1427,13 @@ function normalizeRecord(opp, schema, config){
               : sv;
     } else {
       display = String(val).trim();
+    }
+
+    // Truncate long text fields — Excel hard limit is 32,767 chars per cell
+    // Long text fields are useful for reference but not for analysis;
+    // truncate at 2,000 chars which is ample for any meaningful content
+    if(display && typeof display === "string" && display.length > 2000){
+      display = display.slice(0, 2000) + "…";
     }
 
     if(display!==""&&display!=null&&display!==undefined){
@@ -1818,11 +1829,17 @@ function buildOpportunitySheet(rows, schema){
   colTypes["Status"] = "text";
 
   var headers = finalCols;
+  var EXCEL_CHAR_LIMIT = 32000; // Excel limit is 32,767 — use 32,000 as safe ceiling
   var data = rows.map(function(row){
     return finalCols.map(function(col){
       if(col==="Status") return row["__Status"]||"";
       var v = row[col];
-      return v!=null ? v : "";
+      if(v==null) return "";
+      // Hard safety net for Excel cell character limit
+      if(typeof v === "string" && v.length > EXCEL_CHAR_LIMIT){
+        return v.slice(0, EXCEL_CHAR_LIMIT) + "…";
+      }
+      return v;
     });
   });
 
