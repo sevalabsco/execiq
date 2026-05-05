@@ -1654,33 +1654,103 @@ function buildExecSummarySheet(rows, schema, config){
   row(["Avg " + lbl.pwin + " in Window",        fmtPct(avg(forecast90,lbl.pwin))],      C_LTBLU);
   spacer();
 
-  // ── SECTION 4: PIPELINE HEALTH SIGNALS ──────────────────────
-  section("PIPELINE HEALTH SIGNALS");
-  tblHdr(["Signal", "Count", "Status"]);
+  // ── SECTION 4: PIPELINE RISKS & ALERTS ──────────────────────
+  section("PIPELINE RISKS & ALERTS");
+  tblHdr(["Signal", "Count", "% of Pipeline", "Status", "Insight"]);
 
-  function healthStatus(val, warnThreshold, critThreshold){
-    if(val===null||val===0) return "✓ OK";
-    if(critThreshold!=null&&val>=critThreshold) return "⚠ Review";
-    if(val>=warnThreshold) return "△ Watch";
-    return "✓ OK";
+  // Global status thresholds — applied uniformly across all signals
+  // 🔴 Critical: ≥ 50%  🟠 Elevated: 25–49%  🟡 Watch: 10–24%  🟢 Healthy: < 10%
+  function getSignalStatus(key, impactPct){
+    if(impactPct === null || impactPct === undefined) return "🟢 Healthy";
+    if(impactPct >= 0.50) return "🔴 Critical";
+    if(impactPct >= 0.25) return "🟠 Elevated";
+    if(impactPct >= 0.10) return "🟡 Watch";
+    return "🟢 Healthy";
   }
 
-  var s60fill  = stagnant60.length > 0 ? C_AMBER : C_WHITE;
-  var s90fill  = stagnant90.length > 0 ? C_AMBER : C_LTBLU;
-  var ovfill   = overdue.length    > 0 ? C_AMBER : C_WHITE;
-  var ndfill   = noDate.length     > 0 ? C_AMBER : C_LTBLU;
-  var npfill   = noPwin.length     > 5 ? C_AMBER : C_WHITE;
-  var concfill = (topClientPct!=null&&topClientPct>0.33) ? C_AMBER : C_LTBLU;
+  // Per-signal insight copy keyed by status
+  var RISK_INSIGHTS = {
+    "stagnant60": {
+      "🔴 Critical": "Over half of active pipeline has stalled beyond 60 days, indicating significant pipeline stagnation.",
+      "🟠 Elevated": "A large portion of pipeline is not progressing, which may impact near-term conversion.",
+      "🟡 Watch":    "Some deals are aging beyond expected timelines — monitor progression closely.",
+      "🟢 Healthy":  "Pipeline progression is within expected timeframes."
+    },
+    "stagnant90": {
+      "🔴 Critical": "A significant share of pipeline is effectively stalled (>90 days), reducing likelihood of conversion.",
+      "🟠 Elevated": "A meaningful portion of deals may be at risk due to extended inactivity.",
+      "🟡 Watch":    "Some older deals may require re-engagement or reassessment.",
+      "🟢 Healthy":  "Minimal long-term stagnation observed."
+    },
+    "overdue": {
+      "🔴 Critical": "A large portion of pipeline is past expected award dates, signaling unreliable forecasting.",
+      "🟠 Elevated": "Decision timelines are slipping across multiple opportunities.",
+      "🟡 Watch":    "Some deals are extending beyond expected timelines.",
+      "🟢 Healthy":  "Decision timelines are largely on track."
+    },
+    "noDate": {
+      "🔴 Critical": "A significant portion of pipeline lacks expected close dates, limiting forecast reliability.",
+      "🟠 Elevated": "Forecast visibility is reduced due to missing timing data.",
+      "🟡 Watch":    "Some opportunities lack estimated award dates.",
+      "🟢 Healthy":  "Most opportunities have defined timelines."
+    },
+    "noPwin": {
+      "🔴 Critical": "Many active opportunities lack win probability, limiting pipeline accuracy.",
+      "🟠 Elevated": "Probability scoring is incomplete across a portion of pipeline.",
+      "🟡 Watch":    "Some opportunities are missing probability inputs.",
+      "🟢 Healthy":  "Probability coverage is strong across pipeline."
+    },
+    "concentration": {
+      "🔴 Critical": "Pipeline is highly concentrated across a few clients, increasing revenue risk exposure.",
+      "🟠 Elevated": "A large share of pipeline is tied to a small number of clients.",
+      "🟡 Watch":    "Moderate concentration across key clients.",
+      "🟢 Healthy":  "Pipeline is well diversified across clients."
+    }
+  };
 
-  var topClientPct = pct(topClients.length?topClients[0][1].fee:0, activeFee);
+  function getSignalInsight(key, status){
+    var cfg = RISK_INSIGHTS[key];
+    if(!cfg || !cfg[status]) return "—";
+    return cfg[status];
+  }
 
-  row(["Stagnant > 60 Days in Stage",  fmtNum(stagnant60.length), healthStatus(stagnant60.length,1,10)], s60fill);
-  row(["Stagnant > 90 Days in Stage",  fmtNum(stagnant90.length), healthStatus(stagnant90.length,1,5)],  s90fill);
-  row(["Overdue Decisions (past " + lbl.estAward + ")", fmtNum(overdue.length), healthStatus(overdue.length,1,5)], ovfill);
-  row(["No " + lbl.estAward + " Set (active)", fmtNum(noDate.length), healthStatus(noDate.length,1,10)], ndfill);
-  row(["Active Opps with No " + lbl.pwin, fmtNum(noPwin.length), healthStatus(noPwin.length,1,10)],      npfill);
-  row(["Top Client Concentration",     fmtPct(topClientPct),
-    topClientPct!=null&&topClientPct>0.33?"⚠ Review":topClientPct!=null&&topClientPct>0.20?"△ Watch":"✓ OK"], concfill);
+  function riskFill(status, alt){
+    if(status === "🔴 Critical") return "FCE4D6";   // red
+    if(status === "🟠 Elevated") return "FFEB9C";   // darker amber/orange
+    if(status === "🟡 Watch")    return "FFF2CC";   // lighter yellow
+    return alt ? C_LTBLU : C_WHITE;
+  }
+
+  // Client concentration uses top 3 clients combined, not just top 1
+  var top3Fee = topClients.slice(0,3).reduce(function(t,e){ return t+e[1].fee; }, 0);
+  var top3Pct = pct(top3Fee, activeFee);
+
+  var activeCount = active.length || 1; // avoid div/0
+
+  var signals = [
+    ["Stagnant > 60 Days in Stage",                    stagnant60.length, pct(stagnant60.length, activeCount), "stagnant60"],
+    ["Stagnant > 90 Days in Stage",                    stagnant90.length, pct(stagnant90.length, activeCount), "stagnant90"],
+    ["Overdue Decisions (past " + lbl.estAward + ")",  overdue.length,    pct(overdue.length,    activeCount), "overdue"],
+    ["No " + lbl.estAward + " Set (active)",           noDate.length,     pct(noDate.length,     activeCount), "noDate"],
+    ["Active Opps with No " + lbl.pwin,                noPwin.length,     pct(noPwin.length,     activeCount), "noPwin"],
+    ["Top 3 Client Concentration (% of Active Pipeline)", null,            top3Pct,                            "concentration"],
+  ];
+
+  signals.forEach(function(sig, i){
+    var label   = sig[0];
+    var count   = sig[1];
+    var impact  = sig[2];
+    var key     = sig[3];
+    var status  = getSignalStatus(key, impact);
+    var insight = getSignalInsight(key, status);
+    var fill    = riskFill(status, i%2===1);
+    push([label,
+           count !== null ? fmtNum(count) : "—",
+           fmtPct(impact),
+           status,
+           insight
+          ], {fill: fill, riskRow: true});
+  });
   spacer();
 
   // ── SECTION 5: STATUS BREAKDOWN ─────────────────────────────
@@ -1742,9 +1812,12 @@ function buildExecSummarySheet(rows, schema, config){
     // KPI tile rows span exactly 4 columns (A–D), one tile per column
     var isKpiRow = isKpiLabel || isKpiValue || isKpiSpacer;
 
+    var isRiskRow = m.riskRow || false;
+
     // Style all columns up to maxCols so merged cells get consistent fills
     var styleCols = (isSectionHdr||isTblHdr||isTitleRow) ? 8
-                  : isKpiRow ? 4
+                  : isKpiRow  ? 4
+                  : isRiskRow ? 8   // extend risk row fills across all 8 cols
                   : Math.max(numCols,1);
 
     for(var ci=0; ci<styleCols; ci++){
@@ -1798,7 +1871,8 @@ function buildExecSummarySheet(rows, schema, config){
         alignment: {
           horizontal: isKpiRow ? "center" : "left",
           vertical:   "center",
-          wrapText:   isKpiLabel ? true : false
+          wrapText:   isKpiLabel ? true : false,
+          shrinkToFit: false
         },
         border: border
       };
@@ -1813,6 +1887,11 @@ function buildExecSummarySheet(rows, schema, config){
     var m = meta[ri];
     if(m.sectionHdr||m.titleRow){
       ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+    // Merge insight cell (col E, index 4) across E–H so full text is visible
+    // Excel won't overflow text into formatted cells — merge is the reliable fix
+    if(m.riskRow){
+      ws["!merges"].push({s:{r:ri,c:4},e:{r:ri,c:7}});
     }
   });
 
@@ -1836,7 +1915,7 @@ function buildExecSummarySheet(rows, schema, config){
     {wch:38}, // B
     {wch:38}, // C
     {wch:38}, // D
-    {wch:18}, // E
+    {wch:38}, // E — insight starts here, overflows into F-H
     {wch:18}, // F
     {wch:18}, // G
     {wch:22}, // H
