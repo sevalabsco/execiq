@@ -1634,32 +1634,13 @@ function buildExecSummarySheet(rows, schema, config){
 
   spacer();
 
-  // ── SECTION 2: WIN / LOSS METRICS ───────────────────────────
-  section("WIN / LOSS METRICS");
-  tblHdr(["Metric", "Value"]);
-  row(["Won Opportunities",        fmtNum(won.length)],                                  C_WHITE);
-  row(["Lost Opportunities",       fmtNum(lost.length)],                                 C_LTBLU);
-  row(["Won Revenue",              fmtCur(wonFee)],                                      C_GREEN);
-  row(["Lost Revenue",             fmtCur(lostFee)],                                     C_RED);
-  row(["Win Rate (by count)",      fmtPct(pct(won.length,resolved.length))],             C_WHITE);
-  row(["Win Rate (by value)",      fmtPct(pct(wonFee,wonFee+lostFee))],                 C_LTBLU);
-  spacer();
+  // ── OVERALL PIPELINE HEALTH — horizontal summary bar ─────────
+  // Pre-compute signal statuses so we can count critical/elevated
+  // before rendering the risks table below
+  var activeCount = active.length || 1;
+  var top3Fee = topClients.slice(0,3).reduce(function(t,e){ return t+e[1].fee; }, 0);
+  var top3Pct = pct(top3Fee, activeFee);
 
-  // ── SECTION 3: 90-DAY FORECAST ──────────────────────────────
-  section("90-DAY FORECAST  (" + lbl.estAward + " within next 90 days)");
-  tblHdr(["Metric", "Value"]);
-  row(["Opportunities in Window",                fmtNum(forecast90.length)],             C_WHITE);
-  row([lbl.ourFee + " in Window",               fmtCur(sum(forecast90,lbl.ourFee))],    C_LTBLU);
-  row(["Weighted Value in Window",               fmtCur(sum(forecast90,lbl.weighted))], C_WHITE);
-  row(["Avg " + lbl.pwin + " in Window",        fmtPct(avg(forecast90,lbl.pwin))],      C_LTBLU);
-  spacer();
-
-  // ── SECTION 4: PIPELINE RISKS & ALERTS ──────────────────────
-  section("PIPELINE RISKS & ALERTS");
-  tblHdr(["Signal", "Count", "% of Pipeline", "Status", "Insight"]);
-
-  // Global status thresholds — applied uniformly across all signals
-  // 🔴 Critical: ≥ 50%  🟠 Elevated: 25–49%  🟡 Watch: 10–24%  🟢 Healthy: < 10%
   function getSignalStatus(key, impactPct){
     if(impactPct === null || impactPct === undefined) return "🟢 Healthy";
     if(impactPct >= 0.50) return "🔴 Critical";
@@ -1667,6 +1648,39 @@ function buildExecSummarySheet(rows, schema, config){
     if(impactPct >= 0.10) return "🟡 Watch";
     return "🟢 Healthy";
   }
+
+  var signalStatuses = [
+    getSignalStatus("stagnant60",    pct(stagnant60.length, activeCount)),
+    getSignalStatus("stagnant90",    pct(stagnant90.length, activeCount)),
+    getSignalStatus("overdue",       pct(overdue.length,    activeCount)),
+    getSignalStatus("noDate",        pct(noDate.length,     activeCount)),
+    getSignalStatus("noPwin",        pct(noPwin.length,     activeCount)),
+    getSignalStatus("concentration", top3Pct),
+  ];
+
+  var criticalCount  = signalStatuses.filter(function(s){ return s === "🔴 Critical"; }).length;
+  var elevatedCount  = signalStatuses.filter(function(s){ return s === "🟠 Elevated"; }).length;
+
+  var overallHealth = criticalCount > 0        ? "🔴 At Risk"
+                    : elevatedCount >= 2        ? "🟠 Needs Attention"
+                    : "🟢 Healthy";
+
+  var healthFill = criticalCount > 0   ? "FCE4D6"
+                 : elevatedCount >= 2  ? "FFEB9C"
+                 : C_GREEN;
+
+  // Three-cell horizontal layout: Critical | Elevated | Overall Health
+  push(["OVERALL PIPELINE HEALTH"], {sectionHdr: true});
+  push([
+    "🔴 Critical Signals:  " + criticalCount,
+    "🟠 Elevated Signals:  " + elevatedCount,
+    "Overall Health:  " + overallHealth
+  ], {fill: healthFill, riskRow: true});
+  spacer();
+
+  // ── SECTION 2: PIPELINE RISKS & ALERTS ──────────────────────
+  section("PIPELINE RISKS & ALERTS");
+  tblHdr(["Signal", "Count", "% of Pipeline", "Status", "Insight"]);
 
   // Per-signal insight copy keyed by status
   var RISK_INSIGHTS = {
@@ -1721,12 +1735,7 @@ function buildExecSummarySheet(rows, schema, config){
     return alt ? C_LTBLU : C_WHITE;
   }
 
-  // Client concentration uses top 3 clients combined, not just top 1
-  var top3Fee = topClients.slice(0,3).reduce(function(t,e){ return t+e[1].fee; }, 0);
-  var top3Pct = pct(top3Fee, activeFee);
-
-  var activeCount = active.length || 1; // avoid div/0
-
+  // Client concentration uses top 3 clients combined
   var signals = [
     ["Stagnant > 60 Days in Stage",                    stagnant60.length, pct(stagnant60.length, activeCount), "stagnant60"],
     ["Stagnant > 90 Days in Stage",                    stagnant90.length, pct(stagnant90.length, activeCount), "stagnant90"],
@@ -1751,6 +1760,26 @@ function buildExecSummarySheet(rows, schema, config){
            insight
           ], {fill: fill, riskRow: true});
   });
+  spacer();
+
+  // ── SECTION 3: 90-DAY FORECAST ──────────────────────────────
+  section("90-DAY FORECAST  (" + lbl.estAward + " within next 90 days)");
+  tblHdr(["Metric", "Value"]);
+  row(["Opportunities in Window",                fmtNum(forecast90.length)],             C_WHITE);
+  row([lbl.ourFee + " in Window",               fmtCur(sum(forecast90,lbl.ourFee))],    C_LTBLU);
+  row(["Weighted Value in Window",               fmtCur(sum(forecast90,lbl.weighted))], C_WHITE);
+  row(["Avg " + lbl.pwin + " in Window",        fmtPct(avg(forecast90,lbl.pwin))],      C_LTBLU);
+  spacer();
+
+  // ── SECTION 4: WIN / LOSS METRICS ───────────────────────────
+  section("WIN / LOSS METRICS");
+  tblHdr(["Metric", "Value"]);
+  row(["Won Opportunities",        fmtNum(won.length)],                                  C_WHITE);
+  row(["Lost Opportunities",       fmtNum(lost.length)],                                 C_LTBLU);
+  row(["Won Revenue",              fmtCur(wonFee)],                                      C_GREEN);
+  row(["Lost Revenue",             fmtCur(lostFee)],                                     C_RED);
+  row(["Win Rate (by count)",      fmtPct(pct(won.length,resolved.length))],             C_WHITE);
+  row(["Win Rate (by value)",      fmtPct(pct(wonFee,wonFee+lostFee))],                 C_LTBLU);
   spacer();
 
   // ── SECTION 5: STATUS BREAKDOWN ─────────────────────────────
