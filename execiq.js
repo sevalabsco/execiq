@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "4.5";
+var VERSION = "4.7";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -758,78 +758,40 @@ async function loadLookupTables(oppBase, config){
     return null;
   }
 
-  // Fire all lookups in parallel
+  // Fire only the lookups that actually contribute unique data.
+  // Eliminated:
+  //   stage        — STAGENAME already in opp record, no ID resolution needed
+  //   role         — firmData.opportunityContactRoles has same data (pre-seeded above)
+  //   clientType   — 404s on all tested instances
+  //   submittalType — server returns SUBMITTALTYPENAME (resolved), not an ID
+  //   primaryCategory / secondaryCategory — server returns CATEGORYNAMELIST (resolved)
   var results = await Promise.all([
-    getLookup("stage.cfc",          "get"),
-    getLookup("stage.cfc",          "getList"),          // some instances use getList
-    getLookup("oppData.cfc",        "getProspectTypes"),
-    getLookup("role.cfc",           "getOpportunityAvailableRoles"),
-    getLookup("role.cfc",           "getList"),
-    getLookup("contractType.cfc",   "getContractTypes"),
-    getLookup("deliveryMethod.cfc", "getDeliveryMethods"),
-    getLookup("clientType.cfc",     "getClientTypes"),
-    getLookup("submittalType.cfc",  "getSubmittalTypes"),
-    // Primary/Secondary categories — correct method is getCategories (POST)
-    // Returns {"COLUMNS":["ID","CATEGORYNAME"],...} for primary
-    // Returns {"COLUMNS":["ID","DISPLAYNAME"],...} for secondary
-    getLookup("primaryCategory.cfc",  "getCategories"),
-    getLookup("secondaryCategory.cfc","getCategories"),
-    null, null, null, null, // placeholders to keep results array indices stable
-    getLookup("staffTeam.cfc",      "getStaffTeamRoles"),  // staff role ID → name (index 15)
+    getLookup("oppData.cfc",       "getProspectTypes"),   // 0: prospect types
+    getLookup("contractType.cfc",  "getContractTypes"),   // 1: contract types
+    getLookup("deliveryMethod.cfc","getDeliveryMethods"), // 2: delivery methods
+    getLookup("staffTeam.cfc",     "getStaffTeamRoles"),  // 3: staff role ID → name
   ]);
 
-  // Merge both stage method variants — use whichever returned JSON
-  function pickJSON(a, b){
-    var ar=parseCFC(a), br=parseCFC(b);
-    return ar.length ? ar : br;
-  }
-  config.lookups.stage      = buildLookup(pickJSON(results[0],results[1]), "STAGEID",           "STAGENAME");
-  config.lookups.prospect   = buildLookup(parseCFC(results[2]),            "ID",                "DISPLAYNAME");
+  config.lookups.prospect = buildLookup(parseCFC(results[0]), "ID",              "DISPLAYNAME");
+  config.lookups.contract = buildLookup(parseCFC(results[1]), "CONTRACTTYPEID",  "CONTRACTNAME");
+  config.lookups.delivery = buildLookup(parseCFC(results[2]), "DELIVERYMETHODID","DELIVERYMETHODNAME");
 
-  // role.cfc returns {data:[{roleid,rolename}]} — parseCFC now handles lowercase
-  var roleRaw = pickJSON(results[3], results[4]);
-  config.lookups.role = buildLookup(roleRaw, "ROLEID", "ROLENAME");
-  // Merge firmData role fallback if .cfc returned nothing
-  if(!Object.keys(config.lookups.role).length && config.lookups.roleFromFirmData){
+  // Role lookup — firmData.opportunityContactRoles pre-seeded in buildClientConfig
+  if(config.lookups.roleFromFirmData && Object.keys(config.lookups.roleFromFirmData).length){
     config.lookups.role = config.lookups.roleFromFirmData;
-    UI.log("  Role lookup: using firmData fallback", "lw");
+    UI.log("✓ Role lookup: " + Object.keys(config.lookups.role).length + " roles (firmData)", "ls");
   }
 
-  config.lookups.contract   = buildLookup(parseCFC(results[5]), "CONTRACTTYPEID","CONTRACTNAME");
-  config.lookups.delivery   = buildLookup(parseCFC(results[6]), "DELIVERYMETHODID","DELIVERYMETHODNAME");
-  config.lookups.clientType = buildLookup(parseCFC(results[7]), "ID",             "DISPLAYNAME");
-  config.lookups.submittal  = buildLookup(parseCFC(results[8]), "SUBMITTALTYPEID","SUBMITTALTYPENAME");
+  // Category lookups — server resolves names via CATEGORYNAMELIST fields directly
+  // Keep empty maps so ID_RESOLUTION fallback works on instances where NAMELIST unavailable
+  config.lookups.priCat = {};
+  config.lookups.secCat = {};
+  config.lookups.clientType = {};
+  config.lookups.submittal  = {};
 
-  // Primary/Secondary categories — try all method variants, use first that returns JSON
-  // Results indices 9-14 are the category variants: priJSON, secJSON, priActive, secActive, priGet, secGet
-  // primaryCategory uses CATEGORYNAME, secondaryCategory uses DISPLAYNAME
-  var priCatRaw = parseCFC(results[9]);
-  var secCatRaw = parseCFC(results[10]);
-
-  // Try CATEGORYNAME first (primary), then DISPLAYNAME (secondary), then generic fallbacks
-  function buildCatLookup(records){
-    if(!records.length) return {};
-    var m = buildLookup(records, "ID", "CATEGORYNAME");
-    if(!Object.keys(m).length) m = buildLookup(records, "ID", "DISPLAYNAME");
-    if(!Object.keys(m).length) m = buildLookup(records, "ID", "NAME");
-    if(!Object.keys(m).length) m = buildLookup(records, "ID", "VALUE");
-    return m;
-  }
-
-  config.lookups.priCat = buildCatLookup(priCatRaw);
-  config.lookups.secCat = buildCatLookup(secCatRaw);
-
-  if(!Object.keys(config.lookups.priCat).length && !Object.keys(config.lookups.secCat).length){
-    UI.log("  ℹ Category lookups unavailable — IDs will show raw", "lw");
-  } else {
-    UI.log("✓ Category lookup: " + Object.keys(config.lookups.priCat).length + " primary, " +
-      Object.keys(config.lookups.secCat).length + " secondary", "ls");
-  }
-
-  // Staff role ID → role name (now at index 15 — 4 category variants added above)
-  var staffRoleRaw = parseCFC(results[15]);
+  // Staff role ID → role name
+  var staffRoleRaw = parseCFC(results[3]);
   config.lookups.staffRoles = buildLookup(staffRoleRaw, "STAFFROLEID", "STAFFROLENAME");
-  // Merge firmData staff roles fallback
   if(!Object.keys(config.lookups.staffRoles).length && config.lookups.staffRolesFromFirmData){
     config.lookups.staffRoles = config.lookups.staffRolesFromFirmData;
     UI.log("  Staff roles: using firmData fallback", "lw");
@@ -1641,17 +1603,35 @@ function buildExecSummarySheet(rows, schema, config){
     push([], {});
   }
 
-  // ── SECTION 1: PIPELINE OVERVIEW ────────────────────────────
-  section("PIPELINE OVERVIEW");
-  tblHdr(["Metric", "Value"]);
-  row(["Total Opportunities",                   fmtNum(rows.length)],                    C_WHITE);
-  row(["Active Opportunities",                  fmtNum(active.length)],                  C_LTBLU);
-  row(["Total Gross Pipeline (" + lbl.ourFee + ")", fmtCur(totalFee)],                   C_WHITE);
-  row(["Active Pipeline (" + lbl.ourFee + ")",  fmtCur(activeFee)],                      C_LTBLU);
-  row(["Weighted Pipeline (" + lbl.weighted + ")", fmtCur(weightedTotal)],               C_WHITE);
-  row(["Average " + lbl.pwin + " (active opps)", fmtPct(avg(active,lbl.pwin))],          C_LTBLU);
-  row(["Average Deal Size (all opps)",           fmtCur(pct(totalFee,rows.length))],      C_WHITE);
-  row(["Average Active Deal Size",               fmtCur(pct(activeFee,active.length))],  C_LTBLU);
+  // ── SECTION 1: PIPELINE OVERVIEW — horizontal KPI tiles ────────
+  // All 8 metrics displayed as KPI tiles across two rows of 4.
+  // Each tile: label (small, top), spacer, value (large, bold), spacer.
+  // Cols A–D = 4 tiles per row, uniform width.
+
+  var avgPwin     = avg(active, lbl.pwin);
+  var avgDealAll  = pct(totalFee, rows.length);
+  var avgDealAct  = pct(activeFee, active.length);
+
+  // ── KPI Row 1: 4 tiles ───────────────────────────────────────
+  push([
+    "TOTAL OPPORTUNITIES",
+    "ACTIVE OPPORTUNITIES",
+    "TOTAL GROSS PIPELINE (" + lbl.ourFee.toUpperCase() + ")",
+    "ACTIVE PIPELINE (" + lbl.ourFee.toUpperCase() + ")"
+  ], {kpiLabel: true});
+  push([fmtNum(rows.length), fmtNum(active.length), fmtCur(totalFee), fmtCur(activeFee)],
+    {kpiValue: true});
+
+  // ── KPI Row 2: 4 tiles ───────────────────────────────────────
+  push([
+    "WEIGHTED PIPELINE (" + lbl.weighted.toUpperCase() + ")",
+    "AVERAGE " + lbl.pwin.toUpperCase(),
+    "AVERAGE DEAL SIZE (ALL OPPS)",
+    "AVERAGE ACTIVE DEAL SIZE"
+  ], {kpiLabel: true});
+  push([fmtCur(weightedTotal), fmtPct(avgPwin), fmtCur(avgDealAll), fmtCur(avgDealAct)],
+    {kpiValue: true});
+
   spacer();
 
   // ── SECTION 2: WIN / LOSS METRICS ───────────────────────────
@@ -1750,30 +1730,64 @@ function buildExecSummarySheet(rows, schema, config){
     var numCols = rowData.length;
 
     // Determine row fill color
-    var rowFill = m.fill || null;
-    var isSectionHdr = m.sectionHdr || false;
-    var isTblHdr     = m.tableHdr   || false;
-    var isTitleRow   = m.titleRow   || false;
-    var isBold       = m.bold       || false;
+    var rowFill      = m.fill        || null;
+    var isSectionHdr = m.sectionHdr  || false;
+    var isTblHdr     = m.tableHdr    || false;
+    var isTitleRow   = m.titleRow    || false;
+    var isBold       = m.bold        || false;
+    var isKpiLabel   = m.kpiLabel    || false;
+    var isKpiValue   = m.kpiValue    || false;
+    var isKpiSpacer  = m.kpiSpacer   || false;
+
+    // KPI tile rows span exactly 4 columns (A–D), one tile per column
+    var isKpiRow = isKpiLabel || isKpiValue || isKpiSpacer;
 
     // Style all columns up to maxCols so merged cells get consistent fills
-    var styleCols = (isSectionHdr||isTblHdr||isTitleRow) ? 8 : Math.max(numCols,1);
+    var styleCols = (isSectionHdr||isTblHdr||isTitleRow) ? 8
+                  : isKpiRow ? 4
+                  : Math.max(numCols,1);
+
     for(var ci=0; ci<styleCols; ci++){
       var addr = XLSX.utils.encode_cell({r:ri, c:ci});
       if(!ws[addr]) ws[addr] = {v:"", t:"s"};
 
-      // Number format — all values are pre-formatted strings, so General is fine
-      // (we formatted them as strings in fmtCur/fmtPct so Excel treats as text)
+      var fill, fclr, fbold, fsize;
 
-      // Apply styles via .s property
-      var fill  = isSectionHdr ? C_NAVY : isTblHdr ? C_BLUE : isTitleRow ? C_NAVY : rowFill;
-      var fclr  = (isSectionHdr||isTblHdr||isTitleRow) ? "FFFFFF" : "000000";
-      var fbold = isSectionHdr||isTblHdr||isTitleRow||isBold;
+      if(isKpiRow){
+        // KPI tiles: navy background, white text throughout
+        fill  = C_NAVY;
+        fclr  = "FFFFFF";
+        fbold = true;                  // bold on both label and value rows
+        fsize = isKpiValue ? 22 : 12;  // 22pt value, 12pt label
+      } else if(isSectionHdr || isTitleRow){
+        fill  = C_NAVY;  fclr = "FFFFFF";  fbold = true;  fsize = 10;
+      } else if(isTblHdr){
+        fill  = C_BLUE;  fclr = "FFFFFF";  fbold = true;  fsize = 10;
+      } else {
+        fill  = rowFill; fclr = "000000";  fbold = isBold; fsize = 10;
+      }
+
+      // White outside border around each tile (label + value cells together).
+      // Each tile occupies 2 rows (label row + value row) × 1 column.
+      // We draw the outside edges only — no border between label and value cells.
+      var border = {};
+      if(isKpiRow){
+        var thick = {style:"thick", color:{rgb:"FFFFFF"}};
+        // Left edge of tile
+        border.left = thick;
+        // Right edge of tile (also serves as left edge of next tile)
+        border.right = thick;
+        // Top edge — only on label rows (top of tile)
+        if(isKpiLabel) border.top = thick;
+        // Bottom edge — only on value rows (bottom of tile)
+        if(isKpiValue) border.bottom = thick;
+        // No border between label and value rows within the same tile
+      }
 
       ws[addr].s = {
         font: {
           name:  "Arial",
-          sz:    10,
+          sz:    fsize || 10,
           bold:  fbold,
           color: {rgb: fclr}
         },
@@ -1782,10 +1796,11 @@ function buildExecSummarySheet(rows, schema, config){
           fgColor: {rgb: fill}
         } : {patternType:"none"},
         alignment: {
-          horizontal: "left",
+          horizontal: isKpiRow ? "center" : "left",
           vertical:   "center",
-          wrapText:   false
-        }
+          wrapText:   isKpiLabel ? true : false
+        },
+        border: border
       };
     }
   });
@@ -1807,20 +1822,24 @@ function buildExecSummarySheet(rows, schema, config){
     if(m.titleRow)   return {hpt:22};
     if(m.sectionHdr) return {hpt:18};
     if(m.tableHdr)   return {hpt:16};
+    if(m.kpiLabel)   return {hpt:52};   // label row — 12pt bold, wrapped
+    if(m.kpiValue)   return {hpt:52};   // value row — 22pt bold
+    if(m.kpiSpacer)  return {hpt:0};    // removed — zero height fallback
     if(!rowData||!rowData.length||!rowData[0]) return {hpt:8}; // spacer
     return {hpt:15};
   });
 
-  // Column widths
+  // Column widths — KPI tile columns (A-D) sized generously for wrapped labels
+  // and large value text. Data table columns below use the same widths.
   ws["!cols"] = [
-    {wch:48}, // A — label / name
-    {wch:18}, // B
-    {wch:16}, // C
-    {wch:16}, // D
-    {wch:16}, // E
+    {wch:38}, // A
+    {wch:38}, // B
+    {wch:38}, // C
+    {wch:38}, // D
+    {wch:18}, // E
     {wch:18}, // F
     {wch:18}, // G
-    {wch:22}, // H — % of pipeline
+    {wch:22}, // H
   ];
 
   // Sheet ref
