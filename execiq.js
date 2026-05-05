@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.4";
+var VERSION = "3.6";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -1110,7 +1110,7 @@ function resolveFieldLabel(upperKey, oppLabels, firmOrgLabels){
     "DTQUALSDATE":             "Quals Due Date",
     "DTPROPOSALDATE":          "Proposal Due Date",
     "DTPRESENTATIONDATE":      "Presentation Date",
-    "DTSTARTDATE":             "Start Date",
+    "DTSTARTDATE":             "Estimated Selection Date", // oppLabels key — resolves to client label e.g. "Expected Award Date", "Estimated Award Date"
     "ESTIMATEDSTARTDATE":      "Estimated Start Date",
     "ESTIMATEDCOMPLETIONDATE": "Estimated Completion Date",
     "PRECONSTARTDATE":         "PreCon Start Date",
