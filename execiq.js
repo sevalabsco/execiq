@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.8";
+var VERSION = "4.5";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -41,6 +41,15 @@ var TYPE_RULES = [
 ];
 
 // ─────────────────────────────────────────────────────────────
+// PREFERRED NAME LIST FIELDS
+// The server returns both ID lists (PRIMARYCATEGORYLIST) and resolved name lists
+// (PRIMARYCATEGORYNAMELIST). We suppress the raw ID lists and use the name lists.
+var PREFER_NAMELIST = new Set([
+  "PRIMARYCATEGORYLIST",
+  "SECONDARYCATEGORYLIST",
+]);
+
+// ─────────────────────────────────────────────────────────────
 // STRUCTURAL NOISE — the ONLY fields suppressed by name.
 // These are fields Unanet always injects into every response
 // regardless of enabled state. They are never user-configured
@@ -71,6 +80,10 @@ var STRUCTURAL_NOISE = new Set([
   "LOCATION",
   // Sales cycle — internal config flag, not user data
   "SALESCYCLE",
+  // Raw category ID lists — server also returns resolved CATEGORYNAMELIST variants
+  // We always prefer the name list; suppress the ID list to avoid duplicate columns
+  "PRIMARYCATEGORYLIST",
+  "SECONDARYCATEGORYLIST",
   // Calculated dupes — suffixed _CALC variants duplicate the primary field
   // (detected by suffix pattern below)
 ]);
@@ -87,6 +100,9 @@ function isStructuralNoise(backendKey){
   // STAFFROLE_{id}ID — internal contact ID companion to STAFFROLE_{id} name field
   // We keep the name field, suppress the ID
   if(/^STAFFROLE_\d+ID$/.test(upper)) return true;
+  // PRIMARYCATEGORYLIST/SECONDARYCATEGORYLIST are in STRUCTURAL_NOISE above
+  // PREFER_NAMELIST check kept as belt-and-suspenders
+  if(PREFER_NAMELIST && PREFER_NAMELIST.has(upper)) return true;
   return false;
 }
 
@@ -131,20 +147,22 @@ var COLUMN_ORDER = [
 // Built dynamically at runtime — this just names the lookup key.
 // ─────────────────────────────────────────────────────────────
 var ID_RESOLUTION = {
-  "OFFICELIST":          "firmOrg",
-  "DIVISIONLIST":        "firmOrg",
-  "STUDIOLIST":          "firmOrg",
-  "PRACTICEAREALIST":    "firmOrg",
-  "TERRITORYLIST":       "firmOrg",
-  "OFFICEDIVISIONLIST":  "firmOrg",
-  "PRIMARYCATEGORYLIST": "priCat",
-  "SECONDARYCATEGORYLIST":"secCat",
-  "CONTRACTTYPES":       "contract",
-  "CLIENTTYPES":         "clientType",
-  "PROSPECTTYPES":       "prospect",
-  "DELIVERYMETHOD":      "delivery",
-  "STAGEID":             "stage",
+  "OFFICELIST":              "firmOrg",
+  "DIVISIONLIST":            "firmOrg",
+  "STUDIOLIST":              "firmOrg",
+  "PRACTICEAREALIST":        "firmOrg",
+  "TERRITORYLIST":           "firmOrg",
+  "OFFICEDIVISIONLIST":      "firmOrg",
+  // Use NAMELIST variants (already resolved by server) — suppress raw ID lists below
+  "PRIMARYCATEGORYLIST":     "priCat",      // fallback if NAMELIST unavailable
+  "SECONDARYCATEGORYLIST":   "secCat",      // fallback if NAMELIST unavailable
+  "CONTRACTTYPES":           "contract",
+  "CLIENTTYPES":             "clientType",
+  "PROSPECTTYPES":           "prospect",
+  "DELIVERYMETHOD":          "delivery",
+  "STAGEID":                 "stage",
 };
+
 
 // ─────────────────────────────────────────────────────────────
 // UI MODULE
@@ -456,7 +474,8 @@ async function probeAvailableFields(oppBase){
     "OFFICELIST","DIVISIONLIST","STUDIOLIST","PRACTICEAREALIST",
     "TERRITORYLIST","OFFICEDIVISIONLIST",
     // Classification
-    "PRIMARYCATEGORYLIST","SECONDARYCATEGORYLIST","CONTRACTTYPES",
+    "PRIMARYCATEGORYLIST","PRIMARYCATEGORYNAMELIST",
+    "SECONDARYCATEGORYLIST","SECONDARYCATEGORYNAMELIST","CONTRACTTYPES",
     "DELIVERYMETHOD","CLIENTTYPES","SERVICETYPES","PROSPECTTYPES",
     "ROLENAME","ROLEID","SUBMITTALTYPENAME","SOLICITATIONNUMBER",
     "CHRFPREC","CHPROPOSALSUB","NAICSCODES","SF330FORM","SF255FORM",
@@ -750,9 +769,13 @@ async function loadLookupTables(oppBase, config){
     getLookup("deliveryMethod.cfc", "getDeliveryMethods"),
     getLookup("clientType.cfc",     "getClientTypes"),
     getLookup("submittalType.cfc",  "getSubmittalTypes"),
-    getLookup("primaryCategory.cfc","getList"),
-    getLookup("secondaryCategory.cfc","getList"),
-    getLookup("staffTeam.cfc",      "getStaffTeamRoles"),  // staff role ID → name
+    // Primary/Secondary categories — correct method is getCategories (POST)
+    // Returns {"COLUMNS":["ID","CATEGORYNAME"],...} for primary
+    // Returns {"COLUMNS":["ID","DISPLAYNAME"],...} for secondary
+    getLookup("primaryCategory.cfc",  "getCategories"),
+    getLookup("secondaryCategory.cfc","getCategories"),
+    null, null, null, null, // placeholders to keep results array indices stable
+    getLookup("staffTeam.cfc",      "getStaffTeamRoles"),  // staff role ID → name (index 15)
   ]);
 
   // Merge both stage method variants — use whichever returned JSON
@@ -777,16 +800,34 @@ async function loadLookupTables(oppBase, config){
   config.lookups.clientType = buildLookup(parseCFC(results[7]), "ID",             "DISPLAYNAME");
   config.lookups.submittal  = buildLookup(parseCFC(results[8]), "SUBMITTALTYPEID","SUBMITTALTYPENAME");
 
-  // Primary/Secondary categories — getList returns HTML on some instances, try getJSON
-  config.lookups.priCat = buildLookup(parseCFC(results[9]),  "CATEGORYID", "CATEGORYNAME");
-  config.lookups.secCat = buildLookup(parseCFC(results[10]), "CATEGORYID", "CATEGORYNAME");
-  // If categories came back empty (HTML response), log and continue — IDs will show as-is
-  if(!Object.keys(config.lookups.priCat).length){
-    UI.log("  Primary category lookup empty — IDs will show raw (no JSON endpoint found)", "lw");
+  // Primary/Secondary categories — try all method variants, use first that returns JSON
+  // Results indices 9-14 are the category variants: priJSON, secJSON, priActive, secActive, priGet, secGet
+  // primaryCategory uses CATEGORYNAME, secondaryCategory uses DISPLAYNAME
+  var priCatRaw = parseCFC(results[9]);
+  var secCatRaw = parseCFC(results[10]);
+
+  // Try CATEGORYNAME first (primary), then DISPLAYNAME (secondary), then generic fallbacks
+  function buildCatLookup(records){
+    if(!records.length) return {};
+    var m = buildLookup(records, "ID", "CATEGORYNAME");
+    if(!Object.keys(m).length) m = buildLookup(records, "ID", "DISPLAYNAME");
+    if(!Object.keys(m).length) m = buildLookup(records, "ID", "NAME");
+    if(!Object.keys(m).length) m = buildLookup(records, "ID", "VALUE");
+    return m;
   }
 
-  // Staff role ID → role name
-  var staffRoleRaw = parseCFC(results[11]);
+  config.lookups.priCat = buildCatLookup(priCatRaw);
+  config.lookups.secCat = buildCatLookup(secCatRaw);
+
+  if(!Object.keys(config.lookups.priCat).length && !Object.keys(config.lookups.secCat).length){
+    UI.log("  ℹ Category lookups unavailable — IDs will show raw", "lw");
+  } else {
+    UI.log("✓ Category lookup: " + Object.keys(config.lookups.priCat).length + " primary, " +
+      Object.keys(config.lookups.secCat).length + " secondary", "ls");
+  }
+
+  // Staff role ID → role name (now at index 15 — 4 category variants added above)
+  var staffRoleRaw = parseCFC(results[15]);
   config.lookups.staffRoles = buildLookup(staffRoleRaw, "STAFFROLEID", "STAFFROLENAME");
   // Merge firmData staff roles fallback
   if(!Object.keys(config.lookups.staffRoles).length && config.lookups.staffRolesFromFirmData){
@@ -1008,7 +1049,9 @@ function isFieldEnabled(upper, backendKey, enabledLower){
     "estimatedstartdate":      "eststartdate",
     "estimatedcompletiondate": "estcompletiondate",
     "primarycategorylist":     "projectcategoryid",
+    "primarycategorynamelist": "projectcategoryid",    // name list variant
     "secondarycategorylist":   "secondarycategoryid",
+    "secondarycategorynamelist":"secondarycategoryid", // name list variant
     "practicearealist":        "practiceareaid",
     "studiolist":              "studioid",
     "officelist":              "officeid",
@@ -1092,7 +1135,9 @@ function resolveFieldLabel(upperKey, oppLabels, firmOrgLabels){
     "TERRITORYLIST":           "Territories",
     "OFFICEDIVISIONLIST":      "Office Division",
     "PRIMARYCATEGORYLIST":     "Primary Categories",
+    "PRIMARYCATEGORYNAMELIST": "Primary Categories",  // resolved name version — preferred
     "SECONDARYCATEGORYLIST":   "Secondary Categories",
+    "SECONDARYCATEGORYNAMELIST":"Secondary Categories", // resolved name version — preferred
     "CONTRACTTYPES":           "Contract Type",
     "DELIVERYMETHOD":          "Delivery Method",
     "CLIENTTYPES":             "Client Types",
@@ -1405,9 +1450,14 @@ function normalizeRecord(opp, schema, config){
 
     // Standard field — apply resolution and type formatting
     if(field.resolve){
-      // ID resolution field
-      display = resolveIDs(val, config.lookups[field.resolve]||{});
-      if(!display) display = String(val).trim();
+      // CATEGORYNAMELIST fields are already resolved by the server — treat as text
+      if(field.upper.endsWith("CATEGORYNAMELIST")){
+        display = String(val).trim();
+      } else {
+        // ID resolution field
+        display = resolveIDs(val, config.lookups[field.resolve]||{});
+        if(!display) display = String(val).trim();
+      }
     } else if(field.type==="date"){
       display = fmtDate(val);
     } else if(field.type==="currency"){
