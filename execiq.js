@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "3.6";
+var VERSION = "3.7";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -1211,10 +1211,11 @@ function resolveFieldLabel(upperKey, oppLabels, firmOrgLabels){
 async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
   UI.log("Fetching all opportunities (no filters, no pagination)...");
 
-  var bodyParts = [
+  // Build the fixed base parameters — these never change between pages
+  var baseParams = [
     "action=getOpportunityGridData","json=1","sort=STAGEID","dir=ASC",
-    "selectedCurrency=USD","start=0","limit=9999","view=0",
-    "ActiveInd=0",            // ALL statuses
+    "selectedCurrency=USD","view=0",
+    "ActiveInd=0",            // ALL statuses — never filter by status
     "SalesCycle=NaN",
     "officeId=0","divisionId=0","studioId=0","practiceAreaId=0",
     "territoryId=0","stageId=0","priCatId=0","secCatId=0",
@@ -1222,59 +1223,115 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
     "dateCreatedModified=0","filteredSearch=0","search="
   ];
 
-  // Request columns from our dynamically-built schema
-  // Standard fields are encoded; UUIDs must NOT be encoded (server requires raw hyphens)
+  // Build visibleColumns list from schema
+  // UUIDs must NOT be encoded — server requires raw hyphens
+  var colParams = [];
   schema.forEach(function(f){
     if(f.isCustom){
-      // UUID — send raw, no encoding
-      bodyParts.push("visibleColumns=" + f.backendKey.toLowerCase());
+      colParams.push("visibleColumns=" + f.backendKey.toLowerCase());
     } else {
-      bodyParts.push("visibleColumns=" + encodeURIComponent(f.backendKey));
+      colParams.push("visibleColumns=" + encodeURIComponent(f.backendKey));
     }
   });
 
-  // Also add any custom UUIDs not already in schema (safety net)
+  // Add any custom UUIDs not already in schema
   var schemaUUIDs = new Set(schema.filter(function(f){ return f.isCustom; })
     .map(function(f){ return f.backendKey.toLowerCase(); }));
   customFieldUUIDs.forEach(function(uuid){
     var uuidLower = uuid.toLowerCase();
     if(!schemaUUIDs.has(uuidLower)){
-      bodyParts.push("visibleColumns=" + uuidLower);
+      colParams.push("visibleColumns=" + uuidLower);
     }
   });
 
-  var data = await fetchJSON(oppBase + "oppActions.cfm", {
-    method:"POST", credentials:"include",
-    headers:{"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest"},
-    body: bodyParts.join("&")
-  });
+  // ── Pagination strategy ───────────────────────────────────────
+  // Unanet's grid endpoint has an implicit server-side page size limit
+  // (observed at ~100 records on large instances regardless of limit= value).
+  // We fetch in pages of 100 and concatenate until we have all records.
+  // The ROWCOUNT field in the first response tells us the total.
+  var PAGE_SIZE = 100;
+  var allRecords = [];
+  var totalExpected = null;
+  var start = 0;
+  var page = 0;
+  var maxPages = 100; // safety ceiling: 100 pages × 100 records = 10,000 opps
 
-  if(!data || !Array.isArray(data.DATA)){
-    UI.log("No data returned from oppActions.cfm", "le");
-    return null;
+  while(page < maxPages){
+    var pageParams = baseParams.concat([
+      "start=" + start,
+      "limit=" + PAGE_SIZE
+    ]).concat(colParams);
+
+    var data = await fetchJSON(oppBase + "oppActions.cfm", {
+      method:"POST", credentials:"include",
+      headers:{"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest"},
+      body: pageParams.join("&")
+    });
+
+    if(!data || !Array.isArray(data.DATA)){
+      if(page === 0){
+        UI.log("No data returned from oppActions.cfm", "le");
+        return null;
+      }
+      // Subsequent page failure — stop here with what we have
+      UI.log("⚠ Page " + (page+1) + " failed — stopping with " + allRecords.length + " records", "lw");
+      break;
+    }
+
+    var pageRecords = data.DATA;
+    allRecords = allRecords.concat(pageRecords);
+
+    // First page: get the total record count
+    if(page === 0){
+      totalExpected = parseInt(data.ROWCOUNT) || pageRecords.length;
+      UI.log("✓ Total opportunities on server: " + totalExpected, "ls");
+      if(totalExpected <= PAGE_SIZE){
+        // All records came back in one page — done
+        UI.log("✓ Single page fetch complete", "ls");
+        break;
+      }
+    }
+
+    UI.log("  Page " + (page+1) + ": " + pageRecords.length + " records (total so far: " + allRecords.length + "/" + totalExpected + ")", "ls");
+
+    // Check if we have everything
+    if(allRecords.length >= totalExpected){
+      break;
+    }
+
+    // Check if last page returned fewer records than requested (end of data)
+    if(pageRecords.length < PAGE_SIZE){
+      break;
+    }
+
+    start += PAGE_SIZE;
+    page++;
   }
 
-  var reported = data.ROWCOUNT || data.DATA.length;
-  var received = data.DATA.length;
-  if(reported !== received){
-    UI.log("⚠ ROWCOUNT=" + reported + " but received=" + received, "lw");
+  UI.log("✓ " + allRecords.length + " of " + (totalExpected||allRecords.length) + " opportunities received", "ls");
+
+  if(totalExpected && allRecords.length < totalExpected){
+    UI.log("⚠ Expected " + totalExpected + " but only received " + allRecords.length, "lw");
   }
-  UI.log("✓ " + received + " of " + reported + " opportunities received", "ls");
+
+  // Build a combined data object matching the original single-page structure
+  var combinedData = {
+    DATA: allRecords,
+    ROWCOUNT: allRecords.length
+  };
 
   // Log any custom field UUIDs that the server did not return
-  // This is a Unanet limitation — certain LEAD slot mappings are not
-  // exposed via the grid endpoint regardless of enabled/GridEnabled state
   var returnedKeys = new Set();
-  if(data.DATA && data.DATA.length > 0){
-    Object.keys(data.DATA[0]).forEach(function(k){ returnedKeys.add(k.toLowerCase()); });
+  if(allRecords.length > 0){
+    Object.keys(allRecords[0]).forEach(function(k){ returnedKeys.add(k.toLowerCase()); });
   }
   customFieldUUIDs.forEach(function(uuid){
     if(!returnedKeys.has(uuid.toLowerCase())){
-      UI.log("  ℹ Server did not return UUID: ..."+uuid.slice(-8)+" (Unanet slot limitation — column will be empty)", "lw");
+      UI.log("  ℹ Server did not return UUID: ..."+uuid.slice(-8)+" (Unanet slot limitation)", "lw");
     }
   });
 
-  return data;
+  return combinedData;
 }
 
 // ─────────────────────────────────────────────────────────────
