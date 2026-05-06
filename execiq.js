@@ -1811,11 +1811,12 @@ function buildExecSummarySheet(rows, schema, config){
 
   // ── SECTION 7: TOP 10 CLIENTS BY PIPELINE ───────────────────
   section("TOP 10 CLIENTS BY PIPELINE");
-  tblHdr(["Client", "Total Opps", "Active", "Won", "Lost", lbl.ourFee, lbl.weighted, "% of Active Pipeline"]);
+  tblHdr(["Client", "Total Opps", "% of Active Pipeline", lbl.ourFee, lbl.weighted, "Active", "Won", "Lost"]);
   topClients.forEach(function(e,i){
     var fill = i%2===0?C_WHITE:C_LTBLU;
-    row([e[0], fmtNum(e[1].count), fmtNum(e[1].active), fmtNum(e[1].won), fmtNum(e[1].lost),
-         fmtCur(e[1].fee), fmtCur(e[1].weighted), fmtPct(pct(e[1].fee,activeFee))], fill);
+    row([e[0], fmtNum(e[1].count), fmtPct(pct(e[1].fee,activeFee)),
+         fmtCur(e[1].fee), fmtCur(e[1].weighted),
+         fmtNum(e[1].active), fmtNum(e[1].won), fmtNum(e[1].lost)], fill);
   });
 
   // ── Build worksheet ──────────────────────────────────────────
