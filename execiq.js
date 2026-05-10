@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "4.7";
+var VERSION = "5.0";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -213,7 +213,21 @@ var UI = (function(){
     "background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;",
     "font-size:12px;font-weight:700;letter-spacing:.3px;transition:all .15s;}",
     "#iq1-btn:hover:not(:disabled){filter:brightness(1.1);}",
-    "#iq1-btn:disabled{background:#1e293b;color:#475569;cursor:not-allowed;}"
+    "#iq1-btn:disabled{background:#1e293b;color:#475569;cursor:not-allowed;}",
+    "#iq1-refresh{width:100%;padding:7px;border:1px solid #1e3a5f;border-radius:6px;",
+    "cursor:pointer;background:transparent;color:#64748b;font-size:11px;",
+    "font-weight:600;letter-spacing:.3px;transition:all .15s;margin-top:5px;display:none;}",
+    "#iq1-refresh:hover{border-color:#2e75b6;color:#e2e8f0;}",
+    "#iq1-filters{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;}",
+    "#iq1-filters label{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:3px;}",
+    "#iq1-filters select{width:100%;background:#0d1526;border:1px solid #1e3a5f;border-radius:4px;",
+    "color:#e2e8f0;font-size:11px;padding:4px 6px;cursor:pointer;}",
+    "#iq1-filters select:focus{outline:none;border-color:#2e75b6;}",
+    "#iq1-window{display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;}",
+    ".iq1-win{flex:1;min-width:60px;padding:4px 2px;border:1px solid #1e3a5f;border-radius:4px;",
+    "background:#0d1526;color:#64748b;font-size:10px;cursor:pointer;text-align:center;transition:all .15s;}",
+    ".iq1-win:hover{border-color:#2e75b6;color:#e2e8f0;}",
+    ".iq1-win.active{background:#1a6cf6;border-color:#1a6cf6;color:#fff;font-weight:700;}"
   ].join("");
 
   function mount(){
@@ -239,8 +253,27 @@ var UI = (function(){
           '<div class="iq1-stat"><div class="iq1-sv" id="sv-cols">--</div><div class="iq1-sl">Fields</div></div>' +
           '<div class="iq1-stat"><div class="iq1-sv" id="sv-cust">--</div><div class="iq1-sl">Custom Fields</div></div>' +
         '</div>' +
+        '<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Date Filtering Options</div>' +
+        '<div id="iq1-filters">' +
+          '<div><label>Date Field</label>' +
+            '<select id="iq1-datefield">' +
+              '<option value="CREATEDATE">Date Created</option>' +
+              '<option value="MODDATE">Last Modified</option>' +
+              '<option value="DTSTARTDATE">Estimated Award Date</option>' +
+              '<option value="DTCLOSEDATE">Actual Close Date</option>' +
+              '<option value="ESTIMATEDSTARTDATE">Estimated PoP Start</option>' +
+            '</select></div>' +
+          '<div><label>Time Window</label>' +
+            '<div id="iq1-window">' +
+              '<button class="iq1-win" data-years="0">YTD</button>' +
+              '<button class="iq1-win" data-years="2">2 Years</button>' +
+              '<button class="iq1-win active" data-years="3">3 Years</button>' +
+              '<button class="iq1-win" data-years="999">All Time</button>' +
+            '</div></div>' +
+        '</div>' +
         '<div id="iq1-log"></div>' +
         '<button id="iq1-btn" disabled>Preparing...</button>' +
+        '<button id="iq1-refresh">↺  Refresh with New Settings</button>' +
       '</div>';
     document.body.appendChild(el);
     elStatus = document.getElementById("iq1-status");
@@ -248,6 +281,34 @@ var UI = (function(){
     elLog    = document.getElementById("iq1-log");
     elBtn    = document.getElementById("iq1-btn");
     document.getElementById("iq1-close").onclick = destroy;
+
+    // Wire window preset buttons
+    document.querySelectorAll(".iq1-win").forEach(function(btn){
+      btn.onclick = function(){
+        document.querySelectorAll(".iq1-win").forEach(function(b){ b.classList.remove("active"); });
+        btn.classList.add("active");
+      };
+    });
+  }
+
+  function showRefresh(fn){
+    var el = document.getElementById("iq1-refresh");
+    if(el){
+      el.style.display = "block";
+      el.onclick = function(){
+        // Reset guard and UI state for a fresh run
+        window.__EXECIQ_P1__ = false;
+        el.style.display = "none";
+        var btn = document.getElementById("iq1-btn");
+        if(btn){ btn.disabled = true; btn.textContent = "Preparing..."; btn.onclick = null; }
+        var log = document.getElementById("iq1-log");
+        if(log) log.innerHTML = "";
+        ["sv-opps","sv-cols","sv-cust"].forEach(function(id){
+          var e = document.getElementById(id); if(e) e.textContent = "--";
+        });
+        fn();
+      };
+    }
   }
 
   function destroy(){
@@ -281,7 +342,17 @@ var UI = (function(){
     elBtn.onclick = fn;
   }
 
-  return { mount, destroy, status, prog, log, stat, enableExport };
+  function getFilterSettings(){
+    var dateField = document.getElementById("iq1-datefield");
+    var activeWin = document.querySelector(".iq1-win.active");
+    return {
+      dateField: dateField ? dateField.value : "CREATEDATE",
+      dateFieldLabel: dateField ? dateField.options[dateField.selectedIndex].text : "Date Created",
+      years: activeWin ? parseInt(activeWin.getAttribute("data-years")) : 3
+    };
+  }
+
+  return { mount, destroy, status, prog, log, stat, enableExport, getFilterSettings, showRefresh };
 })();
 
 // ─────────────────────────────────────────────────────────────
@@ -1215,8 +1286,39 @@ function resolveFieldLabel(upperKey, oppLabels, firmOrgLabels){
 // STEP 5: FETCH ALL OPPORTUNITIES
 // No filters, no pagination, columns from schema only
 // ─────────────────────────────────────────────────────────────
-async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
-  UI.log("Fetching all opportunities (no filters, no pagination)...");
+async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs, filterSettings){
+  var dateField  = (filterSettings && filterSettings.dateField)  || "CREATEDATE";
+  var dateLabel  = (filterSettings && filterSettings.dateFieldLabel) || "Date Created";
+  var years      = (filterSettings && filterSettings.years !== undefined) ? filterSettings.years : 3;
+  var allTime    = years >= 999;
+
+  // Compute the cutoff date
+  var cutoffDate = null;
+  if(!allTime){
+    cutoffDate = new Date();
+    if(years === 0){
+      // Current year — Jan 1 of this year
+      cutoffDate = new Date(cutoffDate.getFullYear(), 0, 1);
+    } else {
+      // Rolling N years back from today
+      cutoffDate.setFullYear(cutoffDate.getFullYear() - years);
+      cutoffDate.setHours(0,0,0,0);
+    }
+  }
+
+  // Server-side date filtering only works for CREATEDATE and MODDATE
+  // All other fields require client-side filtering after fetch
+  var serverSideFilter = !allTime && (dateField === "CREATEDATE" || dateField === "MODDATE");
+  var clientSideFilter = !allTime && !serverSideFilter;
+
+  var windowLabel = allTime ? "All Time"
+    : years === 0 ? "Current Year"
+    : "Last " + years + " Years";
+  UI.log("Fetching opportunities — " + dateLabel + " · " + windowLabel + "...");
+
+  // Build the cutoff timestamp for server-side filtering
+  // oppActions.cfm accepts dateCreated/dateModified as Unix timestamps (ms)
+  var cutoffTs = cutoffDate ? cutoffDate.getTime() : 0;
 
   // Build the fixed base parameters — these never change between pages
   var baseParams = [
@@ -1226,7 +1328,10 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
     "SalesCycle=NaN",
     "officeId=0","divisionId=0","studioId=0","practiceAreaId=0",
     "territoryId=0","stageId=0","priCatId=0","secCatId=0",
-    "masterSub=0","staffRoleId=0","dateCreated=0","dateModified=0",
+    "masterSub=0","staffRoleId=0",
+    // Server-side date filters — 0 means no filter
+    "dateCreated=" + (serverSideFilter && dateField==="CREATEDATE" ? cutoffTs : 0),
+    "dateModified=" + (serverSideFilter && dateField==="MODDATE" ? cutoffTs : 0),
     "dateCreatedModified=0","filteredSearch=0","search="
   ];
 
@@ -1319,6 +1424,40 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs){
 
   if(totalExpected && allRecords.length < totalExpected){
     UI.log("⚠ Expected " + totalExpected + " but only received " + allRecords.length, "lw");
+  }
+
+  // ── Client-side date filter ───────────────────────────────────
+  if(clientSideFilter && cutoffDate){
+    var before = allRecords.length;
+    var noDateCount = 0;
+    allRecords = allRecords.filter(function(rec){
+      var raw = rec[dateField] || rec[dateField.toLowerCase()] || "";
+      if(!raw || raw === ""){
+        noDateCount++;
+        return false; // exclude records with no date in the selected field
+      }
+      // Parse the date value
+      var d = null;
+      var s = String(raw).trim();
+      if(/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)){
+        var p=s.slice(0,10).split("/"); d=new Date(parseInt(p[2]),parseInt(p[0])-1,parseInt(p[1]));
+      } else if(/^\d{4}-\d{2}-\d{2}/.test(s)){
+        var p=s.slice(0,10).split("-"); d=new Date(parseInt(p[0]),parseInt(p[1])-1,parseInt(p[2]));
+      } else {
+        var m=s.match(/^(\w+),\s*(\d+)\s+(\d{4})/);
+        if(m) d=new Date(m[1]+" "+m[2]+","+m[3]);
+      }
+      if(!d || isNaN(d.getTime())) { noDateCount++; return false; }
+      return d >= cutoffDate;
+    });
+    var excluded = before - allRecords.length;
+    if(noDateCount > 0){
+      UI.log("⚠ " + noDateCount + " records have no " + dateLabel + " and were excluded from this extract.", "lw");
+    }
+    if(excluded > noDateCount){
+      UI.log("  Filtered " + (excluded - noDateCount) + " records outside the " + windowLabel + " window.", "ls");
+    }
+    UI.log("✓ " + allRecords.length + " records after date filter", "ls");
   }
 
   // Build a combined data object matching the original single-page structure
@@ -2049,8 +2188,8 @@ function buildOpportunitySheet(rows, schema){
 // ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
-async function main(){
-  UI.mount();
+async function main(isRefresh){
+  if(!isRefresh) UI.mount();
   UI.prog(5);
   UI.status("Starting — locating CRM endpoints...");
 
@@ -2124,8 +2263,13 @@ async function main(){
   UI.prog(60);
 
   // 7. Fetch all opportunities
+  var filterSettings = UI.getFilterSettings();
+  UI.log("Date filter: " + filterSettings.dateFieldLabel + " · " +
+    (filterSettings.years >= 999 ? "All Time" :
+     filterSettings.years === 0  ? "YTD" :
+     "Last " + filterSettings.years + " Years"), "ls");
   UI.status("Fetching all opportunities...");
-  var oppData = await fetchAllOpportunities(oppBase, schema, customUUIDs);
+  var oppData = await fetchAllOpportunities(oppBase, schema, customUUIDs, filterSettings);
   if(!oppData){
     UI.status("Failed to retrieve opportunity data.", "er");
     return;
@@ -2203,6 +2347,9 @@ async function main(){
   UI.prog(100);
   UI.status(cleanRows.length + " opportunities ready for export");
   UI.log("✓ Done — click Export to download.", "ls");
+
+  // Show Refresh button so user can rerun with different date settings
+  UI.showRefresh(function(){ main(true); });
 
   // 11. Export
   UI.enableExport(function(){
