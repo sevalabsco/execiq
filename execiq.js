@@ -2213,11 +2213,16 @@ function buildClientAnalysisSheet(rows, schema, config){
   }
 
   var lbl = {
-    ourFee:   clientLabel("IFIRMFEE")     || "Our Fee",
-    weighted: clientLabel("IFACTOREDFEE") || "Weighted Value",
-    client:   clientLabel("COMPANY")      || "Client Company",
-    pwin:     clientLabel("IPROBABILITY") || "Pwin",
+    ourFee:      clientLabel("IFIRMFEE")     || "Our Fee",
+    weighted:    clientLabel("IFACTOREDFEE") || "Weighted Value",
+    client:      clientLabel("COMPANY")      || "Client Company",
+    pwin:        clientLabel("IPROBABILITY") || "Pwin",
+    daysInStage: clientLabel("DAYSINSTAGE")  || "Days in Stage",
+    estAward:    clientLabel("DTSTARTDATE")  || "Estimated Award Date",
   };
+
+  // today needed for overdue calculation in section D
+  var today = new Date(); today.setHours(0,0,0,0);
 
   // ── Helpers ──────────────────────────────────────────────────
   function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
@@ -2336,8 +2341,9 @@ function buildClientAnalysisSheet(rows, schema, config){
 
   // ── SECTION C: WIN RATE BY CLIENT (min 3 resolved opps) ─────
   section("C. WIN RATE BY CLIENT  (minimum 3 resolved opportunities)");
-  tblHdr(["Client", "Win %", "Revenue Health", "Won $", "Lost $",
-          "Avg Deal Size", "Total Resolved", "Signal", "Insight"]);
+  push(["Client", "Win %", "Revenue Health", "Won $", "Lost $",
+        "Avg Deal Size", "Total Resolved", "Signal", "Insight"],
+       {tableHdr:true, extendToMax:true});
 
   // Portfolio benchmarks for signal thresholds
   var totalPipelineAvg = pct(
@@ -2406,61 +2412,192 @@ function buildClientAnalysisSheet(rows, schema, config){
   spacer();
 
   // ── SECTION D: AT-RISK CLIENTS ───────────────────────────────
+  // One row per client — highest severity signal wins.
+  // Healthy rows are suppressed; only Watch / Elevated / Critical are shown.
+  // Positive signals (High-Efficiency, Strategic) are also shown.
   section("D. AT-RISK CLIENTS");
-  tblHdr(["Client", "Risk Signal", "Total Pipeline", "Active Pipeline",
-          "Win Rate", "Revenue Health", "Active Opps", "Insight"]);
+  push(["Client", "Risk Type", "Severity", "Pipeline $", "Win %", "Insight"],
+       {tableHdr:true, extendToMax:true});
 
-  var portfolioAvgFee = totalPipelineAvg;
+  // Severity rank for priority comparison (higher = worse / more notable)
+  var SEV_RANK = {
+    "🔴 Critical":       4,
+    "🟠 Elevated":       3,
+    "🟡 Watch":          2,
+    "🟢 Positive Signal":1,
+    "🟢 Healthy":        0
+  };
+  var SEV_FILL = {
+    "🔴 Critical":        "FCE4D6",
+    "🟠 Elevated":        "FFEB9C",
+    "🟡 Watch":           "FFF2CC",
+    "🟢 Positive Signal": C_GREEN,
+    "🟢 Healthy":         C_WHITE
+  };
 
+  // Helper: evaluate all risk types for a client, return highest-severity non-healthy signal
+  function evaluateClient(c){
+    var winRate    = pct(c.won, c.won+c.lost);
+    var resolved   = c.won + c.lost;
+    var clientActivePct = pct(c.activeFee, activeFee);  // % of total active pipeline
+    var forecastRatio   = pct(c.weightedFee, c.activeFee); // weighted / active
+    var activeOpps      = pipeline.filter(function(r){
+      return r["__Status"]==="Active" && String(r[lbl.client]||"").trim()===c.name;
+    });
+    var stagnant60count = activeOpps.filter(function(r){
+      return (parseFloat(r[lbl.daysInStage])||0) >= 60;
+    }).length;
+    var overdueCount = activeOpps.filter(function(r){
+      var v = r[lbl.estAward]; if(!v) return false;
+      var d = v instanceof Date ? v : new Date(v);
+      return !isNaN(d.getTime()) && d < today;
+    }).length;
+    var stagnantPct = pct(stagnant60count, activeOpps.length);
+    var overduePct  = pct(overdueCount,    activeOpps.length);
+
+    var candidates = [];
+
+    // 1. CONCENTRATION RISK
+    var concSev, concInsight;
+    if(clientActivePct === null || clientActivePct < 0.10){
+      concSev = "🟢 Healthy";
+    } else if(clientActivePct < 0.20){
+      concSev     = "🟡 Watch";
+      concInsight = "Client represents a meaningful portion of active pipeline and should be monitored for concentration growth.";
+    } else if(clientActivePct < 0.30){
+      concSev     = "🟠 Elevated";
+      concInsight = "Pipeline exposure to this client is elevated relative to overall portfolio diversification.";
+    } else {
+      concSev     = "🔴 Critical";
+      concInsight = "Client represents a disproportionate share of active pipeline, creating significant concentration risk.";
+    }
+    if(SEV_RANK[concSev] > 1) candidates.push({type:"Concentration Risk", sev:concSev, insight:concInsight});
+
+    // 2. PURSUIT EFFICIENCY RISK
+    if(c.opps >= 5 && winRate !== null){
+      var pursuitSev, pursuitInsight;
+      if(winRate >= 0.45){
+        pursuitSev = "🟢 Healthy";
+      } else if(winRate >= 0.30){
+        pursuitSev     = "🟡 Watch";
+        pursuitInsight = "Conversion performance is moderate and may warrant monitoring as pursuit volume increases.";
+      } else if(winRate >= 0.15 && c.opps >= 5){
+        pursuitSev     = "🟠 Elevated";
+        pursuitInsight = "Pursuit effort appears misaligned with historical conversion performance.";
+      } else if(winRate < 0.15 && c.opps >= 8){
+        pursuitSev     = "🔴 Critical";
+        pursuitInsight = "Significant pursuit activity has produced consistently weak conversion results.";
+      } else {
+        pursuitSev = "🟢 Healthy";
+      }
+      if(SEV_RANK[pursuitSev] > 1) candidates.push({type:"Pursuit Efficiency Risk", sev:pursuitSev, insight:pursuitInsight});
+    }
+
+    // 3. FORECAST RISK (only clients with active pipeline)
+    if(c.activeFee > 0 && forecastRatio !== null){
+      var fcastSev, fcastInsight;
+      if(forecastRatio >= 0.55){
+        fcastSev = "🟢 Healthy";
+      } else if(forecastRatio >= 0.40){
+        fcastSev     = "🟡 Watch";
+        fcastInsight = "Forecast confidence is moderate and should be monitored for changes in pipeline quality.";
+      } else if(forecastRatio >= 0.25){
+        fcastSev     = "🟠 Elevated";
+        fcastInsight = "Forecast confidence for this client is below portfolio targets.";
+      } else {
+        fcastSev     = "🔴 Critical";
+        fcastInsight = "Forecast confidence for this client is low relative to active pipeline value.";
+      }
+      if(SEV_RANK[fcastSev] > 1) candidates.push({type:"Forecast Risk", sev:fcastSev, insight:fcastInsight});
+    }
+
+    // 4. STAGNATION RISK (only clients with active opps)
+    if(activeOpps.length > 0 && stagnantPct !== null){
+      var stagSev, stagInsight;
+      if(stagnantPct < 0.15){
+        stagSev = "🟢 Healthy";
+      } else if(stagnantPct < 0.30){
+        stagSev     = "🟡 Watch";
+        stagInsight = "Some client opportunities are aging beyond expected progression timelines.";
+      } else if(stagnantPct < 0.50){
+        stagSev     = "🟠 Elevated";
+        stagInsight = "Pipeline progression with this client appears slower than expected.";
+      } else {
+        stagSev     = "🔴 Critical";
+        stagInsight = "Most active pursuits for this client have stalled beyond expected timelines.";
+      }
+      if(SEV_RANK[stagSev] > 1) candidates.push({type:"Stagnation Risk", sev:stagSev, insight:stagInsight});
+    }
+
+    // 5. SLIPPAGE RISK (only clients with active opps)
+    if(activeOpps.length > 0 && overduePct !== null){
+      var slipSev, slipInsight;
+      if(overduePct < 0.10){
+        slipSev = "🟢 Healthy";
+      } else if(overduePct < 0.25){
+        slipSev     = "🟡 Watch";
+        slipInsight = "Some opportunities are extending beyond expected award timelines.";
+      } else if(overduePct < 0.40){
+        slipSev     = "🟠 Elevated";
+        slipInsight = "Decision timelines for this client continue to slip across multiple pursuits.";
+      } else {
+        slipSev     = "🔴 Critical";
+        slipInsight = "A significant portion of client opportunities are past expected award dates.";
+      }
+      if(SEV_RANK[slipSev] > 1) candidates.push({type:"Slippage Risk", sev:slipSev, insight:slipInsight});
+    }
+
+    // 6. HIGH-EFFICIENCY (positive signal)
+    if(winRate !== null && winRate >= 0.60 && resolved >= 5 &&
+       clientActivePct !== null && clientActivePct < 0.10){
+      candidates.push({
+        type:    "High-Efficiency Client",
+        sev:     "🟢 Positive Signal",
+        insight: "Client demonstrates strong historical conversion across a moderate pursuit portfolio."
+      });
+    }
+
+    // 7. STRATEGIC (positive signal)
+    if(winRate !== null && winRate >= 0.50 &&
+       clientActivePct !== null && clientActivePct >= 0.10 && resolved >= 5){
+      candidates.push({
+        type:    "Strategic Client",
+        sev:     "🟢 Positive Signal",
+        insight: "Client represents a strategically significant account with strong historical conversion performance."
+      });
+    }
+
+    if(!candidates.length) return null;
+
+    // Return highest-severity signal
+    candidates.sort(function(a,b){ return SEV_RANK[b.sev] - SEV_RANK[a.sev]; });
+    return candidates[0];
+  }
+
+  // Build at-risk list — one row per client, highest signal only
   var atRisk = [];
   clientList.forEach(function(c){
-    var winRate   = pct(c.won, c.won+c.lost);
-    var revHealth = pct(c.wonFee, c.wonFee+c.lostFee);
-    var resolved  = c.won + c.lost;
-    var hasWinData = resolved >= 2;
-    var signals   = [];
-
-    // At-Risk Pursuit: Win % < 20% AND closed opps >= 5
-    if(hasWinData && winRate !== null && winRate < 0.20 && resolved >= 5){
-      signals.push({
-        signal:  "🔴 At-Risk Pursuit",
-        insight: "Client demonstrates consistently low conversion despite repeated pursuit investment.",
-        fill:    "FCE4D6"
-      });
-    }
-    // Inefficient High-Volume: opp count >= 8 AND Win % < 30%
-    if(c.opps >= 8 && hasWinData && winRate !== null && winRate < 0.30){
-      signals.push({
-        signal:  "🟠 Inefficient High-Volume",
-        insight: "High pursuit volume with limited conversion efficiency.",
-        fill:    "FFEB9C"
-      });
-    }
-    // Large-Dollar / Low-Win: pipeline >= portfolio avg AND Win % < 25%
-    if(c.totalFee >= portfolioAvgFee && hasWinData && winRate !== null && winRate < 0.25){
-      signals.push({
-        signal:  "🟡 Large-Dollar / Low-Win",
-        insight: "Large pipeline exposure with historically weak conversion performance.",
-        fill:    "FFF2CC"
-      });
-    }
-
-    signals.forEach(function(sig){
-      atRisk.push({c:c, sig:sig, winRate:winRate, revHealth:revHealth});
-    });
+    var signal = evaluateClient(c);
+    if(!signal) return;
+    var winRate = pct(c.won, c.won+c.lost);
+    atRisk.push({c:c, signal:signal, winRate:winRate});
   });
 
-  atRisk.sort(function(a,b){ return b.c.totalFee - a.c.totalFee; });
+  // Sort: Critical first, then by pipeline $ descending within each severity
+  atRisk.sort(function(a,b){
+    var sd = SEV_RANK[b.signal.sev] - SEV_RANK[a.signal.sev];
+    return sd !== 0 ? sd : b.c.activeFee - a.c.activeFee;
+  });
 
   if(atRisk.length === 0){
-    dataRow(["✓ No at-risk clients identified based on current thresholds."], C_GREEN);
+    dataRow(["✓ No signals identified based on current thresholds."], C_GREEN);
   } else {
     atRisk.forEach(function(item){
-      push([item.c.name, item.sig.signal,
-            fmtCur(item.c.totalFee), fmtCur(item.c.activeFee),
-            fmtPct(item.winRate), fmtPct(item.revHealth),
-            fmtNum(item.c.active), item.sig.insight],
-           {fill:item.sig.fill, hasInsight:true});
+      var fill = SEV_FILL[item.signal.sev] || C_WHITE;
+      push([item.c.name, item.signal.type, item.signal.sev,
+            fmtCur(item.c.activeFee), fmtPct(item.winRate),
+            item.signal.insight],
+           {fill:fill, hasInsight:true});
     });
   }
 
@@ -2483,9 +2620,10 @@ function buildClientAnalysisSheet(rows, schema, config){
     // Table headers: use row's own column count (not maxCols) so section A/B headers
     // don't bleed into section C's extra columns.
     // hasInsight rows: extend to maxCols so fill covers the merged insight cell.
-    var styleCols = (isSectionHdr||isTitleRow) ? Math.max(rowData.length, 1)
-                  : isTblHdr     ? Math.max(rowData.length, 1)
-                  : m.hasInsight ? maxCols
+    var styleCols = (isSectionHdr||isTitleRow)           ? Math.max(rowData.length, 1)
+                  : (isTblHdr && m.extendToMax)           ? maxCols
+                  : isTblHdr                              ? Math.max(rowData.length, 1)
+                  : m.hasInsight                          ? maxCols
                   : Math.max(rowData.length, 1);
 
     for(var ci=0; ci<styleCols; ci++){
@@ -2536,11 +2674,11 @@ function buildClientAnalysisSheet(rows, schema, config){
   // Column widths
   ws["!cols"] = [
     {wch:32}, // A — client name
-    {wch:14}, // B — win %
-    {wch:16}, // C — revenue health
-    {wch:18}, // D — won $
-    {wch:18}, // E — lost $
-    {wch:18}, // F — avg deal size / insight start
+    {wch:14}, // B — win % / risk type
+    {wch:16}, // C — revenue health / severity
+    {wch:18}, // D — won $ / pipeline $
+    {wch:14}, // E — lost $ / win %
+    {wch:18}, // F — avg deal / insight start
     {wch:14}, // G — total resolved
     {wch:24}, // H — signal
     {wch:55}, // I — insight (merged)
