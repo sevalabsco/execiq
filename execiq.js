@@ -5,7 +5,7 @@ javascript:(function(){
 if(window.__EXECIQ_P1__){console.warn("[ExecIQ] Already running.");return;}
 window.__EXECIQ_P1__ = true;
 
-var VERSION = "5.0";
+var VERSION = "5.3";
 // xlsx-js-style: drop-in replacement for SheetJS with full cell style support
 // Same API, same XLSX global — fills, fonts, borders, alignment all apply in Excel
 var SHEETJS = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
@@ -471,6 +471,46 @@ function classifyStatus(stageName, activeInd){
     return "Closed";
   }
   return "Active";
+}
+
+// Classify opportunity type based on master/sub relationship fields.
+// masterLookup maps ILEADID → raw opp record for parent resolution.
+//
+// On-Call Master:  SUBCOUNT > 0, no MASTERLEADID, has DTONCALLSTART
+//   → contract ceiling; exclude from pipeline totals
+// Work Order:      MASTERLEADID → master that has DTONCALLSTART
+//   → actual pursuit under on-call contract; include in pipeline
+// Teamed Master:   SUBCOUNT > 0, no MASTERLEADID, no DTONCALLSTART
+//   → single pursuit with teaming partners; include in pipeline
+// Teaming Sub:     MASTERLEADID → master that has no DTONCALLSTART
+//   → partner share of teamed pursuit; exclude to avoid double-count
+// Standalone:      no MASTERLEADID, no SUBCOUNT (or SUBCOUNT=0)
+//   → normal opportunity; include in pipeline
+function classifyOppType(opp, masterLookup){
+  var masterLeadId = String(opp.MASTERLEADID || "").trim();
+  var subCount     = parseInt(opp.SUBCOUNT)   || 0;
+  var hasOncall    = !!(opp.DTONCALLSTART && String(opp.DTONCALLSTART).trim());
+
+  if(masterLeadId){
+    // Sub-record — look up parent to determine type
+    var master = masterLookup[masterLeadId];
+    var masterHasOncall = master && master.DTONCALLSTART &&
+                          String(master.DTONCALLSTART).trim() !== "";
+    return masterHasOncall ? "Work Order" : "Teaming Sub";
+  }
+
+  if(subCount > 0){
+    return hasOncall ? "On-Call Master" : "Teamed Master";
+  }
+
+  return "Standalone";
+}
+
+// Returns true if this opp type should be included in pipeline reporting
+function isInPipeline(oppType){
+  return oppType === "Standalone"    ||
+         oppType === "Work Order"    ||
+         oppType === "Teamed Master";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1460,10 +1500,25 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs, filterSe
     UI.log("✓ " + allRecords.length + " records after date filter", "ls");
   }
 
+  // ── Build master lookup map ─────────────────────────────────────
+  // Maps ILEADID → raw record for every record that has SUBCOUNT > 0
+  // Used by classifyOppType to identify master type (on-call vs teamed)
+  var masterLookup = {};
+  allRecords.forEach(function(rec){
+    var subCount = parseInt(rec.SUBCOUNT) || 0;
+    var ileadId  = String(rec.ILEADID || "").trim();
+    if(subCount > 0 && ileadId) masterLookup[ileadId] = rec;
+  });
+  var masterCount = Object.keys(masterLookup).length;
+  if(masterCount > 0){
+    UI.log("✓ Master lookup: " + masterCount + " master record(s) identified", "ls");
+  }
+
   // Build a combined data object matching the original single-page structure
   var combinedData = {
     DATA: allRecords,
-    ROWCOUNT: allRecords.length
+    ROWCOUNT: allRecords.length,
+    masterLookup: masterLookup   // passed through for use in normalizeRecord
   };
 
   // Log any custom field UUIDs that the server did not return
@@ -1485,7 +1540,8 @@ async function fetchAllOpportunities(oppBase, schema, customFieldUUIDs, filterSe
 // Apply type formatting, ID resolution, and label mapping
 // entirely from the dynamic schema — no hardcoded field names
 // ─────────────────────────────────────────────────────────────
-function normalizeRecord(opp, schema, config){
+function normalizeRecord(opp, schema, config, masterLookup){
+  masterLookup = masterLookup || {};
   var row = {};
 
   // Computed meta fields
@@ -1495,6 +1551,29 @@ function normalizeRecord(opp, schema, config){
   row["__Pwin"]     = (opp.IPROBABILITY!=null&&opp.IPROBABILITY!=="")
                       ? parseFloat(opp.IPROBABILITY)/100 : null;
   row["__Stage"]    = String(opp.STAGENAME||"");
+
+  // Opp type classification — drives pipeline inclusion and display
+  var oppType = classifyOppType(opp, masterLookup);
+  row["__OppType"]     = oppType;
+  row["__InPipeline"]  = isInPipeline(oppType);
+
+  // For subs (Work Orders and Teaming Subs) — link back to parent
+  var masterLeadId = String(opp.MASTERLEADID || "").trim();
+  if(masterLeadId){
+    var master = masterLookup[masterLeadId];
+    row["__MasterNumber"] = master ? String(master.VCHLEADNUMBER || "") : "";
+    row["__MasterName"]   = master ? String(master.VCHPROJECTNAME || "") : "";
+    // For Work Orders — pull contract period from master
+    if(oppType === "Work Order" && master){
+      row["__ContractStart"] = master.DTONCALLSTART ? fmtDate(master.DTONCALLSTART) : null;
+      row["__ContractEnd"]   = master.DTONCALLEND   ? fmtDate(master.DTONCALLEND)   : null;
+    }
+  }
+  // For On-Call Masters — pull contract period from own fields
+  if(oppType === "On-Call Master"){
+    row["__ContractStart"] = opp.DTONCALLSTART ? fmtDate(opp.DTONCALLSTART) : null;
+    row["__ContractEnd"]   = opp.DTONCALLEND   ? fmtDate(opp.DTONCALLEND)   : null;
+  }
 
   // Build a lowercase key → value map of the raw opp record once
   // so UUID lookups are case-insensitive without repeated scanning
@@ -1637,11 +1716,22 @@ function buildExecSummarySheet(rows, schema, config){
   var today = new Date(); today.setHours(0,0,0,0);
   var d90   = new Date(today.getTime()+90*24*60*60*1000);
 
-  var active   = rows.filter(function(r){ return r["__Status"]==="Active"; });
-  var won      = rows.filter(function(r){ return r["__Status"]==="Won"; });
-  var lost     = rows.filter(function(r){ return r["__Status"]==="Lost"; });
-  var closed   = rows.filter(function(r){ return r["__Status"]==="Closed"; });
+  // Filter to pipeline-eligible records only
+  // On-Call Masters and Teaming Subs are excluded to avoid double-counting
+  var pipelineRows = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var excludedCount = rows.length - pipelineRows.length;
+
+  // All status buckets operate on pipeline-eligible records only
+  var active   = pipelineRows.filter(function(r){ return r["__Status"]==="Active"; });
+  var won      = pipelineRows.filter(function(r){ return r["__Status"]==="Won"; });
+  var lost     = pipelineRows.filter(function(r){ return r["__Status"]==="Lost"; });
+  var closed   = pipelineRows.filter(function(r){ return r["__Status"]==="Closed"; });
   var resolved = won.concat(lost);
+
+  // Keep full rows reference for total opp count display
+  // but use pipelineRows for all financial calculations
+  var allRows = rows;
+  rows = pipelineRows;
 
   var totalFee      = sum(rows,   lbl.ourFee);
   var activeFee     = sum(active, lbl.ourFee);
@@ -1758,7 +1848,7 @@ function buildExecSummarySheet(rows, schema, config){
     "TOTAL GROSS PIPELINE (" + lbl.ourFee.toUpperCase() + ")",
     "ACTIVE PIPELINE (" + lbl.ourFee.toUpperCase() + ")"
   ], {kpiLabel: true});
-  push([fmtNum(rows.length), fmtNum(active.length), fmtCur(totalFee), fmtCur(activeFee)],
+  push([fmtNum(allRows.length), fmtNum(active.length), fmtCur(totalFee), fmtCur(activeFee)],
     {kpiValue: true});
 
   // ── KPI Row 2: 4 tiles ───────────────────────────────────────
@@ -1935,7 +2025,12 @@ function buildExecSummarySheet(rows, schema, config){
     row([s[0], fmtNum(s[1]), fmtPct(s[2]), fmtCur(s[3]), s[4]!=null?fmtCur(s[4]):"—"], fill);
   });
   // Total row
-  row(["TOTAL", fmtNum(rows.length), fmtPct(1), fmtCur(totalFee), "—"], C_DGREY, true);
+  row(["TOTAL", fmtNum(pipelineRows.length), fmtPct(1), fmtCur(totalFee), "—"], C_DGREY, true);
+  // Show excluded records if any exist
+  if(excludedCount > 0){
+    row(["* " + excludedCount + " record(s) excluded from pipeline totals (On-Call Masters and Teaming Subs)"],
+        C_DGREY);
+  }
   spacer();
 
   // ── SECTION 6: STAGE DISTRIBUTION ───────────────────────────
@@ -2098,6 +2193,365 @@ function buildExecSummarySheet(rows, schema, config){
 
 
 // ─────────────────────────────────────────────────────────────
+// CLIENT ANALYSIS SHEET
+// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// CLIENT ANALYSIS SHEET
+// Derived entirely from cleanRows — no additional data calls.
+// Pipeline-eligible records only (__InPipeline !== false).
+// ─────────────────────────────────────────────────────────────
+function buildClientAnalysisSheet(rows, schema, config){
+
+  // ── Field label resolver ─────────────────────────────────────
+  function clientLabel(backendKey){
+    var upper = backendKey.toUpperCase();
+    for(var i=0;i<schema.length;i++){
+      if(schema[i].upper===upper||schema[i].backendKey.toUpperCase()===upper)
+        return schema[i].label;
+    }
+    return null;
+  }
+
+  var lbl = {
+    ourFee:   clientLabel("IFIRMFEE")     || "Our Fee",
+    weighted: clientLabel("IFACTOREDFEE") || "Weighted Value",
+    client:   clientLabel("COMPANY")      || "Client Company",
+    pwin:     clientLabel("IPROBABILITY") || "Pwin",
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
+  function fmtPct(v){ if(v==null||v==="") return ""; return (v*100).toFixed(1)+"%"; }
+  function fmtNum(v){ if(v==null||v==="") return ""; return Math.round(v).toLocaleString("en-US"); }
+  function pct(n,d){ return d>0?n/d:null; }
+
+  // ── Filter to pipeline-eligible records ──────────────────────
+  var pipeline = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var active   = pipeline.filter(function(r){ return r["__Status"]==="Active"; });
+  var activeFee = active.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); },0);
+
+  // ── Build per-client aggregates ──────────────────────────────
+  // Pipeline metrics (fee totals, active counts) use pipeline-eligible records only.
+  // Win/loss metrics use ALL records so historical outcomes on teaming subs
+  // and on-call work orders are captured — a firm cares about win rate
+  // across all pursuits with a client, not just the ones in current pipeline.
+  var clients = {};
+
+  // First pass: pipeline metrics
+  pipeline.forEach(function(r){
+    var c = String(r[lbl.client]||"Unknown").trim();
+    if(!clients[c]) clients[c] = {
+      name:c, totalFee:0, weightedFee:0, activeFee:0,
+      opps:0, active:0, won:0, lost:0, wonFee:0, lostFee:0
+    };
+    var fee      = parseFloat(r[lbl.ourFee])||0;
+    var weighted = parseFloat(r[lbl.weighted])||0;
+    var status   = r["__Status"];
+    clients[c].opps++;
+    clients[c].totalFee    += fee;
+    clients[c].weightedFee += weighted;
+    if(status==="Active"){ clients[c].active++;   clients[c].activeFee += fee; }
+    if(status==="Won")   { clients[c].won++;       clients[c].wonFee    += fee; }
+    if(status==="Lost")  { clients[c].lost++;      clients[c].lostFee   += fee; }
+  });
+
+  // Second pass: win/loss from ALL records (including excluded types)
+  // Only update won/lost/wonFee/lostFee for records not already counted above
+  rows.filter(function(r){ return r["__InPipeline"] === false; }).forEach(function(r){
+    var c = String(r[lbl.client]||"Unknown").trim();
+    if(!clients[c]) return; // only update clients already in pipeline — don't add new rows
+    var fee    = parseFloat(r[lbl.ourFee])||0;
+    var status = r["__Status"];
+    if(status==="Won") { clients[c].won++;  clients[c].wonFee  += fee; }
+    if(status==="Lost"){ clients[c].lost++; clients[c].lostFee += fee; }
+  });
+
+  var clientList = Object.values(clients);
+
+  // ── Sheet builder ─────────────────────────────────────────────
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY  = "1F3864";
+  var C_BLUE  = "2E75B6";
+  var C_LTBLU = "D6E4F0";
+  var C_WHITE = "FFFFFF";
+  var C_GREEN = "E2EFDA";
+  var C_POSGRN = "C6EFCE"; // stronger green for positive signals (High-Efficiency, Strategic)
+  var C_RED   = "FCE4D6";
+  var C_AMBER = "FFF2CC";
+  var C_DGREY = "F2F2F2";
+
+  function section(title){
+    push([title], {sectionHdr:true});
+  }
+  function tblHdr(cols){
+    push(cols, {tableHdr:true});
+  }
+  function dataRow(cols, fill, bold){
+    push(cols, {fill:fill||null, bold:bold||false});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Client Analysis", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  push([],{});
+
+  // ── SECTION A: TOP CLIENTS BY REVENUE ────────────────────────
+  section("A. TOP CLIENTS BY REVENUE");
+  tblHdr(["Client", "Total Pipeline (" + lbl.ourFee + ")", "Weighted Pipeline",
+          "% of Active Pipeline", "# of Opps", "Avg Deal Size", "Win Rate"]);
+
+  var byRevenue = clientList.slice().sort(function(a,b){ return b.totalFee-a.totalFee; }).slice(0,15);
+  byRevenue.forEach(function(c,i){
+    var winRate   = pct(c.won, c.won+c.lost);
+    var avgDeal   = pct(c.totalFee, c.opps);
+    var pctActive = pct(c.activeFee, activeFee);
+    var fill = i%2===0?C_WHITE:C_LTBLU;
+    dataRow([c.name, fmtCur(c.totalFee), fmtCur(c.weightedFee),
+             fmtPct(pctActive), fmtNum(c.opps), fmtCur(avgDeal), fmtPct(winRate)], fill);
+  });
+  spacer();
+
+  // ── SECTION B: TOP CLIENTS BY VOLUME ────────────────────────
+  section("B. TOP CLIENTS BY VOLUME");
+  tblHdr(["Client", "# of Opps", "Total Pipeline (" + lbl.ourFee + ")", "Weighted Pipeline",
+          "% of Active Pipeline", "Avg Deal Size", "Win Rate"]);
+
+  var byVolume = clientList.slice().sort(function(a,b){
+    return b.opps !== a.opps ? b.opps-a.opps : b.totalFee-a.totalFee;
+  }).slice(0,15);
+  byVolume.forEach(function(c,i){
+    var winRate   = pct(c.won, c.won+c.lost);
+    var avgDeal   = pct(c.totalFee, c.opps);
+    var pctActive = pct(c.activeFee, activeFee);
+    var fill = i%2===0?C_WHITE:C_LTBLU;
+    dataRow([c.name, fmtNum(c.opps), fmtCur(c.totalFee), fmtCur(c.weightedFee),
+             fmtPct(pctActive), fmtCur(avgDeal), fmtPct(winRate)], fill);
+  });
+  spacer();
+
+  // ── SECTION C: WIN RATE BY CLIENT (min 3 resolved opps) ─────
+  section("C. WIN RATE BY CLIENT  (minimum 3 resolved opportunities)");
+  tblHdr(["Client", "Win %", "Revenue Health", "Won $", "Lost $",
+          "Avg Deal Size", "Total Resolved", "Signal", "Insight"]);
+
+  // Portfolio benchmarks for signal thresholds
+  var totalPipelineAvg = pct(
+    clientList.reduce(function(t,c){ return t+c.totalFee; }, 0),
+    clientList.length || 1
+  );
+  var wonClients = clientList.filter(function(c){ return c.won > 0; });
+  var WON_THRESHOLD = wonClients.length
+    ? wonClients.reduce(function(t,c){ return t+c.wonFee; }, 0) / wonClients.length
+    : 0;
+
+  // Only clients with 3+ resolved (won+lost) opps, sorted by Revenue Health desc
+  var resolvedClients = clientList.filter(function(c){ return (c.won+c.lost) >= 3; })
+    .sort(function(a,b){
+      var ah = pct(a.wonFee, a.wonFee+a.lostFee)||0;
+      var bh = pct(b.wonFee, b.wonFee+b.lostFee)||0;
+      return bh - ah;
+    });
+
+  if(resolvedClients.length === 0){
+    dataRow(["No clients with 3+ resolved opportunities yet."], C_DGREY);
+  } else {
+    resolvedClients.forEach(function(c, i){
+      var winRate   = pct(c.won, c.won+c.lost);
+      var revHealth = pct(c.wonFee, c.wonFee+c.lostFee);
+      var avgDeal   = pct(c.totalFee, c.opps);
+      var resolved  = c.won + c.lost;
+
+      // Signal logic — evaluated in priority order
+      var signal, insight, fill;
+
+      if(winRate !== null && winRate < 0.20 && resolved >= 5){
+        signal  = "🔴 At-Risk Pursuit";
+        insight = "Client demonstrates consistently low conversion despite repeated pursuit investment.";
+        fill    = "FCE4D6";
+      } else if(c.opps >= 8 && winRate !== null && winRate < 0.30){
+        signal  = "🟠 Inefficient High-Volume";
+        insight = "High pursuit volume with limited conversion efficiency.";
+        fill    = "FFEB9C";
+      } else if(c.totalFee >= totalPipelineAvg && winRate !== null && winRate < 0.25){
+        signal  = "🟡 Large-Dollar / Low-Win";
+        insight = "Large pipeline exposure with historically weak conversion performance.";
+        fill    = "FFF2CC";
+      } else if(winRate !== null && winRate >= 0.60 && resolved >= 5 &&
+                 pct(c.activeFee, activeFee) !== null && pct(c.activeFee, activeFee) < 0.10){
+        signal  = "🟢 High-Efficiency";
+        insight = "Client demonstrates strong conversion efficiency across a moderate pursuit portfolio.";
+        fill    = C_GREEN;
+      } else if(winRate !== null && winRate >= 0.50 && c.wonFee >= WON_THRESHOLD){
+        signal  = "🟢 Strategic";
+        insight = "Client demonstrates strong historical conversion and revenue generation.";
+        fill    = C_GREEN;
+      } else {
+        signal  = "—";
+        insight = winRate !== null && winRate >= 0.40
+          ? "Moderate performance — monitor and evaluate pursuit criteria."
+          : "Insufficient signal — continue tracking as data grows.";
+        fill    = i%2===0 ? C_WHITE : C_LTBLU;
+      }
+
+      push([c.name, fmtPct(winRate), fmtPct(revHealth), fmtCur(c.wonFee), fmtCur(c.lostFee),
+            fmtCur(avgDeal), fmtNum(resolved), signal, insight],
+           {fill:fill, hasInsight:true});
+    });
+  }
+  spacer();
+
+  // ── SECTION D: AT-RISK CLIENTS ───────────────────────────────
+  section("D. AT-RISK CLIENTS");
+  tblHdr(["Client", "Risk Signal", "Total Pipeline", "Active Pipeline",
+          "Win Rate", "Revenue Health", "Active Opps", "Insight"]);
+
+  var portfolioAvgFee = totalPipelineAvg;
+
+  var atRisk = [];
+  clientList.forEach(function(c){
+    var winRate   = pct(c.won, c.won+c.lost);
+    var revHealth = pct(c.wonFee, c.wonFee+c.lostFee);
+    var resolved  = c.won + c.lost;
+    var hasWinData = resolved >= 2;
+    var signals   = [];
+
+    // At-Risk Pursuit: Win % < 20% AND closed opps >= 5
+    if(hasWinData && winRate !== null && winRate < 0.20 && resolved >= 5){
+      signals.push({
+        signal:  "🔴 At-Risk Pursuit",
+        insight: "Client demonstrates consistently low conversion despite repeated pursuit investment.",
+        fill:    "FCE4D6"
+      });
+    }
+    // Inefficient High-Volume: opp count >= 8 AND Win % < 30%
+    if(c.opps >= 8 && hasWinData && winRate !== null && winRate < 0.30){
+      signals.push({
+        signal:  "🟠 Inefficient High-Volume",
+        insight: "High pursuit volume with limited conversion efficiency.",
+        fill:    "FFEB9C"
+      });
+    }
+    // Large-Dollar / Low-Win: pipeline >= portfolio avg AND Win % < 25%
+    if(c.totalFee >= portfolioAvgFee && hasWinData && winRate !== null && winRate < 0.25){
+      signals.push({
+        signal:  "🟡 Large-Dollar / Low-Win",
+        insight: "Large pipeline exposure with historically weak conversion performance.",
+        fill:    "FFF2CC"
+      });
+    }
+
+    signals.forEach(function(sig){
+      atRisk.push({c:c, sig:sig, winRate:winRate, revHealth:revHealth});
+    });
+  });
+
+  atRisk.sort(function(a,b){ return b.c.totalFee - a.c.totalFee; });
+
+  if(atRisk.length === 0){
+    dataRow(["✓ No at-risk clients identified based on current thresholds."], C_GREEN);
+  } else {
+    atRisk.forEach(function(item){
+      push([item.c.name, item.sig.signal,
+            fmtCur(item.c.totalFee), fmtCur(item.c.activeFee),
+            fmtPct(item.winRate), fmtPct(item.revHealth),
+            fmtNum(item.c.active), item.sig.insight],
+           {fill:item.sig.fill, hasInsight:true});
+    });
+  }
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  // Compute maxCols up front — needed by both the style loop and the merge loop
+  var maxCols = 0;
+  aoa.forEach(function(r){ if(r.length>maxCols) maxCols=r.length; });
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var rowFill      = m.fill       || null;
+    var isSectionHdr = m.sectionHdr || false;
+    var isTblHdr     = m.tableHdr   || false;
+    var isTitleRow   = m.titleRow   || false;
+    var isBold       = m.bold       || false;
+
+    // Table headers: use row's own column count (not maxCols) so section A/B headers
+    // don't bleed into section C's extra columns.
+    // hasInsight rows: extend to maxCols so fill covers the merged insight cell.
+    var styleCols = (isSectionHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                  : isTblHdr     ? Math.max(rowData.length, 1)
+                  : m.hasInsight ? maxCols
+                  : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold;
+      if(isSectionHdr||isTitleRow){ fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTblHdr){            fill=C_BLUE; fclr="FFFFFF"; fbold=true; }
+      else{                         fill=rowFill; fclr="000000"; fbold=isBold; }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:10, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: { horizontal:"left", vertical:"center", wrapText:false }
+      };
+    }
+  });
+
+  // Merges for section headers and title
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.sectionHdr||m.titleRow){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+    // Merge insight cell only on rows explicitly tagged — prevents Win Rate column
+    // from being swallowed on section A/B rows which also have 6+ columns
+    if(m.hasInsight){
+      // Insight is always the last column; detect position from row length
+      var insightCol = aoa[ri].length - 1;
+      if(insightCol >= 5){
+        ws["!merges"].push({s:{r:ri,c:insightCol},e:{r:ri,c:maxCols-1}});
+      }
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)   return {hpt:22};
+    if(m.sectionHdr) return {hpt:18};
+    if(m.tableHdr)   return {hpt:16};
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+  // Column widths
+  ws["!cols"] = [
+    {wch:32}, // A — client name
+    {wch:14}, // B — win %
+    {wch:16}, // C — revenue health
+    {wch:18}, // D — won $
+    {wch:18}, // E — lost $
+    {wch:18}, // F — avg deal size / insight start
+    {wch:14}, // G — total resolved
+    {wch:24}, // H — signal
+    {wch:55}, // I — insight (merged)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+}
+
+
+// ─────────────────────────────────────────────────────────────
 // STEP 7: BUILD EXCEL SHEET
 // ─────────────────────────────────────────────────────────────
 function buildOpportunitySheet(rows, schema){
@@ -2106,7 +2560,7 @@ function buildOpportunitySheet(rows, schema){
   var orderedLabels = [];
 
   // Always-first columns
-  ["Opportunity Number","Opportunity Name","Client Company","Owner Company",
+  ["Opportunity Number","Opportunity Name","Opp Type","Master Contract","Client Company","Owner Company",
    "Opportunity Owner","Stage","Status","Days in Stage"].forEach(function(l){
     if(!orderedLabels.includes(l)) orderedLabels.push(l);
   });
@@ -2132,6 +2586,8 @@ function buildOpportunitySheet(rows, schema){
   schema.forEach(function(f){
     if(f.isCustom && f.label) seenLabels[f.label] = 1;
   });
+  // Always show opp type columns
+  seenLabels["Opp Type"] = 1;
 
   // Final ordered column list — only labels that have data
   var finalCols = orderedLabels.filter(function(l){ return seenLabels[l]; });
@@ -2149,7 +2605,11 @@ function buildOpportunitySheet(rows, schema){
   var EXCEL_CHAR_LIMIT = 32000; // Excel limit is 32,767 — use 32,000 as safe ceiling
   var data = rows.map(function(row){
     return finalCols.map(function(col){
-      if(col==="Status") return row["__Status"]||"";
+      if(col==="Status")          return row["__Status"]||"";
+      if(col==="Opp Type")        return row["__OppType"]||"Standalone";
+      if(col==="Master Contract") return row["__MasterNumber"]
+        ? row["__MasterNumber"] + (row["__MasterName"] ? " — " + row["__MasterName"] : "")
+        : "";
       var v = row[col];
       if(v==null) return "";
       // Hard safety net for Excel cell character limit
@@ -2283,7 +2743,7 @@ async function main(isRefresh){
   var normErrors = 0;
   oppData.DATA.forEach(function(opp, idx){
     try{
-      cleanRows.push(normalizeRecord(opp, schema, config));
+      cleanRows.push(normalizeRecord(opp, schema, config, oppData.masterLookup||{}));
     }catch(e){
       normErrors++;
       UI.log("⚠ Row " + idx + " error: " + e.message, "lw");
@@ -2340,10 +2800,13 @@ async function main(isRefresh){
   UI.log("Building Exec Summary...");
   XLSX.utils.book_append_sheet(wb, buildExecSummarySheet(cleanRows, schema, config), "Exec Summary");
 
+  UI.log("Building Client Analysis...");
+  XLSX.utils.book_append_sheet(wb, buildClientAnalysisSheet(cleanRows, schema, config), "Client Analysis");
+
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
 
-  UI.log("✓ Workbook ready — 2 sheets", "ls");
+  UI.log("✓ Workbook ready — 3 sheets", "ls");
   UI.prog(100);
   UI.status(cleanRows.length + " opportunities ready for export");
   UI.log("✓ Done — click Export to download.", "ls");
