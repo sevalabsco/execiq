@@ -221,6 +221,661 @@
         await runExport(filters, startDate, endDate);
     };
     
+    // ═══════════════════════════════════════════════════════════
+    // ACTIVITIES ANALYSIS BUILDER
+    // ═══════════════════════════════════════════════════════════
+    
+    function buildActivitiesAnalysis(activities) {
+        const now = new Date();
+        const day30 = new Date(now - 30 * 24 * 60 * 60 * 1000);
+        const day60 = new Date(now - 60 * 24 * 60 * 60 * 1000);
+        const day90 = new Date(now - 90 * 24 * 60 * 60 * 1000);
+        const day180 = new Date(now - 180 * 24 * 60 * 60 * 1000);
+        
+        // Helper: Split semicolon-delimited fields into arrays
+        function splitField(val) {
+            if (!val) return [];
+            return val.split(';').map(s => s.trim()).filter(s => s);
+        }
+        
+        // ─── 1. BUILD CLIENT ANALYSIS ───────────────────────────
+        const clientMap = {};
+        
+        activities.forEach(act => {
+            const companies = splitField(act['Company(ies)']);
+            const owners = splitField(act['Owner(s)']);
+            const contacts = splitField(act['Contact(s)']);
+            const opps = splitField(act['Opportunity(ies)']);
+            const callType = act['Call Type'] || '';
+            const startDate = act['Start Date'];
+            
+            companies.forEach(company => {
+                if (!company) return;
+                
+                if (!clientMap[company]) {
+                    clientMap[company] = {
+                        total: 0,
+                        last30: 0,
+                        last60: 0,
+                        last90: 0,
+                        owners: new Set(),
+                        contacts: new Set(),
+                        opps: new Set(),
+                        meetings: 0,
+                        meetings90: 0,
+                        callTypes: {},
+                        lastActivity: null,
+                        lastOwner: '',
+                        lastCallType: '',
+                        activities: []
+                    };
+                }
+                
+                const client = clientMap[company];
+                client.total++;
+                client.activities.push(act);
+                
+                if (startDate >= day30) client.last30++;
+                if (startDate >= day60) client.last60++;
+                if (startDate >= day90) client.last90++;
+                
+                owners.forEach(o => client.owners.add(o));
+                contacts.forEach(c => client.contacts.add(c));
+                opps.forEach(op => client.opps.add(op));
+                
+                if (callType.toLowerCase().includes('meeting')) {
+                    client.meetings++;
+                    if (startDate >= day90) client.meetings90++;
+                }
+                
+                client.callTypes[callType] = (client.callTypes[callType] || 0) + 1;
+                
+                if (!client.lastActivity || startDate > client.lastActivity) {
+                    client.lastActivity = startDate;
+                    client.lastOwner = owners[0] || '';
+                    client.lastCallType = callType;
+                }
+            });
+        });
+        
+        // ─── 2. BUILD OWNER ANALYSIS ─────────────────────────────
+        const ownerMap = {};
+        
+        activities.forEach(act => {
+            const owners = splitField(act['Owner(s)']);
+            const companies = splitField(act['Company(ies)']);
+            const contacts = splitField(act['Contact(s)']);
+            const callType = act['Call Type'] || '';
+            const startDate = act['Start Date'];
+            
+            owners.forEach(owner => {
+                if (!owner) return;
+                
+                if (!ownerMap[owner]) {
+                    ownerMap[owner] = {
+                        total: 0,
+                        companies: new Set(),
+                        contacts: new Set(),
+                        callTypes: {},
+                        lastActivity: null
+                    };
+                }
+                
+                const o = ownerMap[owner];
+                o.total++;
+                companies.forEach(c => o.companies.add(c));
+                contacts.forEach(c => o.contacts.add(c));
+                o.callTypes[callType] = (o.callTypes[callType] || 0) + 1;
+                
+                if (!o.lastActivity || startDate > o.lastActivity) {
+                    o.lastActivity = startDate;
+                }
+            });
+        });
+        
+        // ─── 3. BUILD OPPORTUNITY ANALYSIS ───────────────────────
+        const oppMap = {};
+        
+        activities.forEach(act => {
+            const opps = splitField(act['Opportunity(ies)']);
+            const contacts = splitField(act['Contact(s)']);
+            const owners = splitField(act['Owner(s)']);
+            const startDate = act['Start Date'];
+            
+            opps.forEach(opp => {
+                if (!opp) return;
+                
+                if (!oppMap[opp]) {
+                    oppMap[opp] = {
+                        total: 0,
+                        last30: 0,
+                        contacts: new Set(),
+                        owners: new Set(),
+                        lastActivity: null
+                    };
+                }
+                
+                const o = oppMap[opp];
+                o.total++;
+                if (startDate >= day30) o.last30++;
+                contacts.forEach(c => o.contacts.add(c));
+                owners.forEach(ow => o.owners.add(ow));
+                
+                if (!o.lastActivity || startDate > o.lastActivity) {
+                    o.lastActivity = startDate;
+                }
+            });
+        });
+        
+        // ─── 4. BUILD CONTACT ANALYSIS ───────────────────────────
+        const contactMap = {};
+        
+        activities.forEach(act => {
+            const contacts = splitField(act['Contact(s)']);
+            const owners = splitField(act['Owner(s)']);
+            const opps = splitField(act['Opportunity(ies)']);
+            const callType = act['Call Type'] || '';
+            const startDate = act['Start Date'];
+            
+            contacts.forEach(contact => {
+                if (!contact) return;
+                
+                if (!contactMap[contact]) {
+                    contactMap[contact] = {
+                        total: 0,
+                        owners: new Set(),
+                        opps: new Set(),
+                        callTypes: {},
+                        lastActivity: null
+                    };
+                }
+                
+                const c = contactMap[contact];
+                c.total++;
+                owners.forEach(o => c.owners.add(o));
+                opps.forEach(op => c.opps.add(op));
+                c.callTypes[callType] = (c.callTypes[callType] || 0) + 1;
+                
+                if (!c.lastActivity || startDate > c.lastActivity) {
+                    c.lastActivity = startDate;
+                }
+            });
+        });
+        
+        // ─── 5. CALCULATE RELATIONSHIP HEALTH SCORES ─────────────
+        const healthScores = [];
+        
+        Object.entries(clientMap).forEach(([company, data]) => {
+            // Recency Score (25 pts)
+            const daysSince = data.lastActivity ? Math.floor((now - data.lastActivity) / (24 * 60 * 60 * 1000)) : 999;
+            let recencyScore = 0;
+            if (daysSince <= 7) recencyScore = 25;
+            else if (daysSince <= 14) recencyScore = 22;
+            else if (daysSince <= 30) recencyScore = 18;
+            else if (daysSince <= 45) recencyScore = 12;
+            else if (daysSince <= 60) recencyScore = 8;
+            else if (daysSince <= 90) recencyScore = 4;
+            
+            // Activity Frequency (20 pts)
+            let freqScore = 0;
+            if (data.last90 >= 20) freqScore = 20;
+            else if (data.last90 >= 15) freqScore = 17;
+            else if (data.last90 >= 10) freqScore = 13;
+            else if (data.last90 >= 6) freqScore = 9;
+            else if (data.last90 >= 3) freqScore = 5;
+            else if (data.last90 >= 1) freqScore = 2;
+            
+            // Meeting Engagement (15 pts)
+            let meetingScore = 0;
+            if (data.meetings90 >= 8) meetingScore = 15;
+            else if (data.meetings90 >= 5) meetingScore = 12;
+            else if (data.meetings90 >= 3) meetingScore = 8;
+            else if (data.meetings90 >= 1) meetingScore = 4;
+            
+            // Contact Coverage (10 pts)
+            const contactCount = data.contacts.size;
+            let contactScore = 0;
+            if (contactCount >= 8) contactScore = 10;
+            else if (contactCount >= 6) contactScore = 8;
+            else if (contactCount >= 4) contactScore = 6;
+            else if (contactCount >= 2) contactScore = 3;
+            else if (contactCount >= 1) contactScore = 1;
+            
+            // Owner Coverage (10 pts)
+            const ownerCount = data.owners.size;
+            let ownerScore = 0;
+            if (ownerCount >= 5) ownerScore = 10;
+            else if (ownerCount >= 4) ownerScore = 8;
+            else if (ownerCount >= 3) ownerScore = 6;
+            else if (ownerCount >= 2) ownerScore = 3;
+            else if (ownerCount >= 1) ownerScore = 1;
+            
+            // Opportunity Engagement (10 pts)
+            const hasOpps = data.opps.size > 0;
+            const hasRecentOppActivity = data.activities.some(a => 
+                a['Opportunity(ies)'] && a['Start Date'] >= day30
+            );
+            let oppScore = 0;
+            if (hasOpps && data.opps.size > 1 && hasRecentOppActivity) oppScore = 10;
+            else if (hasOpps && hasRecentOppActivity) oppScore = 7;
+            else if (hasOpps && !hasRecentOppActivity) oppScore = 3;
+            
+            const totalScore = recencyScore + freqScore + meetingScore + contactScore + ownerScore + oppScore;
+            
+            // Status
+            let status = 'Critical';
+            if (totalScore >= 85) status = 'Healthy';
+            else if (totalScore >= 70) status = 'Stable';
+            else if (totalScore >= 55) status = 'Watch';
+            else if (totalScore >= 40) status = 'Elevated Risk';
+            
+            // Critical Flags - IMPROVED LOGIC
+            const flags = [];
+            if (daysSince >= 90) flags.push('No Activity 90+ Days');
+            if (contactCount === 0) flags.push('No Contacts');
+            else if (contactCount === 1) flags.push('Single Contact');
+            if (ownerCount === 0) flags.push('No Owner');
+            else if (ownerCount === 1) flags.push('Single Owner');
+            if (hasOpps && !hasRecentOppActivity) flags.push('Stale Pursuit');
+            if (data.meetings90 === 0 && data.total > 5) flags.push('No Meetings');
+            
+            healthScores.push({
+                company,
+                score: totalScore,
+                status,
+                daysSince,
+                owners: ownerCount,
+                contacts: contactCount,
+                meetings90: data.meetings90,
+                activities90: data.last90,
+                flags: flags.join('; ') || 'None'
+            });
+        });
+        
+        // ─── 6. BUILD WORKSHEET WITH ALL SECTIONS ────────────────
+        const aoa = [];
+        const BLUE = '4472C4';
+        const WHITE = 'FFFFFF';
+        const GREEN = 'C6E0B4';
+        const YELLOW = 'FFE699';
+        const ORANGE = 'F4B084';
+        const RED = 'F8CBAD';
+        
+        function header(text) {
+            aoa.push([text]);
+        }
+        
+        function spacer() {
+            aoa.push([]);
+        }
+        
+        // SECTION 1: Most Active Clients
+        header('MOST ACTIVE CLIENTS');
+        aoa.push(['Company', 'Total Activities', 'Last 30d', 'Last 60d', 'Last 90d', 'Owners', 'Contacts', 'Meetings (90d)', 'Last Activity']);
+        
+        const topClients = Object.entries(clientMap)
+            .sort((a, b) => b[1].total - a[1].total)
+            .slice(0, 25);
+        
+        topClients.forEach(([company, data]) => {
+            aoa.push([
+                company,
+                data.total,
+                data.last30,
+                data.last60,
+                data.last90,
+                data.owners.size,
+                data.contacts.size,
+                data.meetings90,
+                data.lastActivity
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 2: Dormant Clients
+        header('CLIENTS NOT CONTACTED RECENTLY');
+        aoa.push(['Company', 'Days Since Last Contact', 'Last Activity', 'Last Owner', 'Last Type', 'Open Opps', 'Risk Level']);
+        
+        const dormant = Object.entries(clientMap)
+            .filter(([_, data]) => {
+                const days = Math.floor((now - data.lastActivity) / (24 * 60 * 60 * 1000));
+                return days >= 30;
+            })
+            .sort((a, b) => {
+                const daysA = Math.floor((now - a[1].lastActivity) / (24 * 60 * 60 * 1000));
+                const daysB = Math.floor((now - b[1].lastActivity) / (24 * 60 * 60 * 1000));
+                return daysB - daysA;
+            })
+            .slice(0, 50);
+        
+        dormant.forEach(([company, data]) => {
+            const days = Math.floor((now - data.lastActivity) / (24 * 60 * 60 * 1000));
+            let risk = 'Watch';
+            if (days >= 180) risk = 'Dormant';
+            else if (days >= 90) risk = 'Gap';
+            else if (days >= 60) risk = 'At Risk';
+            
+            aoa.push([
+                company,
+                days,
+                data.lastActivity,
+                data.lastOwner,
+                data.lastCallType,
+                data.opps.size,
+                risk
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 3: Activity by Owner
+        header('ACTIVITY BY OWNER');
+        aoa.push(['Owner', 'Total Activities', 'Companies', 'Contacts', 'Avg per Month', 'Last Activity']);
+        
+        const ownerList = Object.entries(ownerMap)
+            .sort((a, b) => b[1].total - a[1].total);
+        
+        ownerList.forEach(([owner, data]) => {
+            const avgPerMonth = Math.round(data.total / 3);
+            aoa.push([
+                owner,
+                data.total,
+                data.companies.size,
+                data.contacts.size,
+                avgPerMonth,
+                data.lastActivity
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 4: Opportunity Engagement
+        header('OPPORTUNITY ENGAGEMENT');
+        aoa.push(['Opportunity', 'Total Activities', 'Last 30d', 'Contacts', 'Owners', 'Last Touch']);
+        
+        const oppList = Object.entries(oppMap)
+            .sort((a, b) => b[1].total - a[1].total)
+            .slice(0, 50);
+        
+        oppList.forEach(([opp, data]) => {
+            aoa.push([
+                opp,
+                data.total,
+                data.last30,
+                data.contacts.size,
+                data.owners.size,
+                data.lastActivity
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 5: Contact Engagement
+        header('CONTACT ENGAGEMENT');
+        aoa.push(['Contact', 'Interactions', 'Last Contact', 'Related Opps', 'Internal Owners']);
+        
+        const contactList = Object.entries(contactMap)
+            .sort((a, b) => b[1].total - a[1].total)
+            .slice(0, 50);
+        
+        contactList.forEach(([contact, data]) => {
+            aoa.push([
+                contact,
+                data.total,
+                data.lastActivity,
+                data.opps.size,
+                data.owners.size
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 6: Relationship Coverage (Risk Analysis)
+        header('RELATIONSHIP COVERAGE ANALYSIS');
+        aoa.push(['Company', 'Internal Owners', 'Client Contacts', 'Coverage Status']);
+        
+        const coverage = Object.entries(clientMap)
+            .sort((a, b) => (a[1].owners.size + a[1].contacts.size) - (b[1].owners.size + b[1].contacts.size))
+            .slice(0, 50);
+        
+        coverage.forEach(([company, data]) => {
+            let status = 'Strong';
+            if (data.owners.size === 1 && data.contacts.size === 1) status = 'Critical - Single Threaded';
+            else if (data.owners.size === 1) status = 'Risk - Single Owner';
+            else if (data.contacts.size === 1) status = 'Risk - Single Contact';
+            else if (data.owners.size === 2 && data.contacts.size === 2) status = 'Moderate';
+            
+            aoa.push([
+                company,
+                data.owners.size,
+                data.contacts.size,
+                status
+            ]);
+        });
+        
+        spacer();
+        spacer();
+        
+        // SECTION 7: Relationship Health Scores
+        header('RELATIONSHIP HEALTH SCORES');
+        aoa.push(['Company', 'Score', 'Status', 'Days Since Contact', 'Owners', 'Contacts', 'Meetings (90d)', 'Activities (90d)', 'Risk Flags']);
+        
+        healthScores.sort((a, b) => b.score - a.score);
+        
+        healthScores.forEach(h => {
+            aoa.push([
+                h.company,
+                h.score,
+                h.status,
+                h.daysSince,
+                h.owners,
+                h.contacts,
+                h.meetings90,
+                h.activities90,
+                h.flags
+            ]);
+        });
+        
+        // ─── 7. CREATE AND FORMAT WORKSHEET ──────────────────────
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        const wsRange = XLSX.utils.decode_range(ws['!ref']);
+        
+        // Track section header rows for proper formatting
+        const sectionHeaders = [];
+        const dataHeaders = [];
+        
+        for (let R = 0; R <= wsRange.e.r; R++) {
+            const cell = ws[XLSX.utils.encode_cell({ r: R, c: 0 })];
+            if (cell && cell.v && typeof cell.v === 'string') {
+                if (cell.v.includes('CLIENTS') || cell.v.includes('ACTIVITY') || 
+                    cell.v.includes('OPPORTUNITY') || cell.v.includes('CONTACT') || 
+                    cell.v.includes('RELATIONSHIP') || cell.v.includes('SCORES')) {
+                    sectionHeaders.push(R);
+                    // Next row after section header is data header
+                    if (R + 1 <= wsRange.e.r) {
+                        dataHeaders.push(R + 1);
+                    }
+                }
+            }
+        }
+        
+        // Apply formatting
+        for (let R = 0; R <= wsRange.e.r; R++) {
+            for (let C = 0; C <= wsRange.e.c; C++) {
+                const addr = XLSX.utils.encode_cell({ r: R, c: C });
+                if (!ws[addr]) continue;
+                
+                const cellValue = ws[addr].v;
+                const isSectionHeader = sectionHeaders.includes(R) && C === 0;
+                const isDataHeader = dataHeaders.includes(R);
+                
+                // Base style
+                ws[addr].s = {
+                    font: {
+                        name: 'Arial',
+                        sz: 10,
+                        bold: false,
+                        color: { rgb: '000000' }
+                    },
+                    alignment: {
+                        vertical: 'center',
+                        horizontal: 'left'
+                    }
+                };
+                
+                // Section headers
+                if (isSectionHeader) {
+                    ws[addr].s.font.bold = true;
+                    ws[addr].s.font.sz = 12;
+                    ws[addr].s.font.color = { rgb: BLUE };
+                    ws[addr].s.alignment.horizontal = 'left';
+                }
+                // Data column headers
+                else if (isDataHeader) {
+                    ws[addr].s.font.bold = true;
+                    ws[addr].s.font.color = { rgb: WHITE };
+                    ws[addr].s.fill = {
+                        patternType: 'solid',
+                        fgColor: { rgb: BLUE }
+                    };
+                }
+                
+                // Format dates
+                if (ws[addr].v instanceof Date) {
+                    ws[addr].t = 'd';
+                    ws[addr].z = 'mm/dd/yyyy';
+                }
+                
+                // Conditional formatting for Health Score Status column
+                if (typeof cellValue === 'string') {
+                    if (cellValue === 'Healthy') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: GREEN }
+                        };
+                        ws[addr].s.font.bold = true;
+                    } else if (cellValue === 'Stable') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: YELLOW }
+                        };
+                    } else if (cellValue === 'Watch') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: ORANGE }
+                        };
+                    } else if (cellValue === 'Elevated Risk' || cellValue === 'Critical') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: RED }
+                        };
+                        ws[addr].s.font.bold = true;
+                    }
+                    
+                    // Risk level formatting for dormant clients
+                    if (cellValue === 'Dormant' || cellValue === 'Gap') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: RED }
+                        };
+                        ws[addr].s.font.bold = true;
+                    } else if (cellValue === 'At Risk') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: ORANGE }
+                        };
+                    }
+                    
+                    // Coverage status formatting
+                    if (cellValue.includes('Critical')) {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: RED }
+                        };
+                        ws[addr].s.font.bold = true;
+                    } else if (cellValue.includes('Risk')) {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: ORANGE }
+                        };
+                    } else if (cellValue === 'Moderate') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: YELLOW }
+                        };
+                    } else if (cellValue === 'Strong') {
+                        ws[addr].s.fill = {
+                            patternType: 'solid',
+                            fgColor: { rgb: GREEN }
+                        };
+                    }
+                }
+                
+                // Number formatting for scores
+                if (typeof cellValue === 'number' && C === 1) {
+                    const rowAbove = ws[XLSX.utils.encode_cell({ r: R - 1, c: C })]?.v;
+                    if (rowAbove === 'Score') {
+                        ws[addr].z = '0';
+                        // Score color coding
+                        if (cellValue >= 85) {
+                            ws[addr].s.fill = {
+                                patternType: 'solid',
+                                fgColor: { rgb: GREEN }
+                            };
+                            ws[addr].s.font.bold = true;
+                        } else if (cellValue >= 70) {
+                            ws[addr].s.fill = {
+                                patternType: 'solid',
+                                fgColor: { rgb: YELLOW }
+                            };
+                        } else if (cellValue >= 55) {
+                            ws[addr].s.fill = {
+                                patternType: 'solid',
+                                fgColor: { rgb: ORANGE }
+                            };
+                        } else {
+                            ws[addr].s.fill = {
+                                patternType: 'solid',
+                                fgColor: { rgb: RED }
+                            };
+                            ws[addr].s.font.bold = true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Auto-size columns
+        const maxCol = wsRange.e.c;
+        const colWidths = [];
+        for (let C = 0; C <= maxCol; C++) {
+            let maxWidth = 10;
+            for (let R = 0; R <= wsRange.e.r; R++) {
+                const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
+                if (cell && cell.v) {
+                    const cellValue = cell.v.toString();
+                    maxWidth = Math.max(maxWidth, cellValue.length);
+                }
+            }
+            colWidths.push({ wch: Math.min(maxWidth + 2, 50) });
+        }
+        ws['!cols'] = colWidths;
+        
+        // Set row heights for section headers
+        if (!ws['!rows']) ws['!rows'] = [];
+        sectionHeaders.forEach(R => {
+            ws['!rows'][R] = { hpt: 25 };
+        });
+        
+        return ws;
+    }
+    
     // Main export function
     async function runExport(filters, startDate, endDate) {
         // Create progress overlay
@@ -474,7 +1129,7 @@
             updateStatus(`✅ Fetched all ${allActivities.length} activities`, 55);
             
             // Parse activities into structured data
-            updateStatus('🔄 Parsing and filtering activity data...', 60);
+            updateStatus('🔄 Parsing activity data...', 60);
             
             let parsedActivities = allActivities.map(activity => {
                 const activityObj = {};
@@ -500,7 +1155,10 @@
                 };
             });
             
-            // Apply filters
+            // Store unfiltered activities for analysis
+            const unfilteredActivities = [...parsedActivities];
+            
+            // Apply filters for Activities tab only
             const beforeFilterCount = parsedActivities.length;
             
             parsedActivities = parsedActivities.filter(activity => {
@@ -522,9 +1180,9 @@
             
             const filteredCount = beforeFilterCount - parsedActivities.length;
             if (filteredCount > 0) {
-                updateStatus(`🔍 Filtered out ${filteredCount} activities`, 65);
+                updateStatus(`🔍 Filtered ${filteredCount} activities for display`, 65);
             }
-            updateStatus(`📊 ${parsedActivities.length} activities match your filters`, 70);
+            updateStatus(`📊 ${parsedActivities.length} activities in filtered view`, 68);
             
             if (parsedActivities.length === 0) {
                 updateStatus('⚠️ No activities match your filters. Try adjusting your criteria.', 100);
@@ -532,7 +1190,7 @@
                 return;
             }
             
-            updateStatus('📋 Sorting by Owner...', 75);
+            updateStatus('📋 Sorting by Owner...', 70);
             
             // Sort by Owner
             parsedActivities.sort((a, b) => {
@@ -542,11 +1200,11 @@
             });
             
             // Create Excel file
-            updateStatus('📝 Creating Excel file...', 80);
+            updateStatus('📝 Creating Excel file...', 75);
             
             // Load xlsx-js-style (same as ExecIQ)
             if (typeof XLSX === 'undefined') {
-                updateStatus('📦 Loading Excel library with styling support...', 85);
+                updateStatus('📦 Loading Excel library with styling support...', 78);
                 try {
                     await new Promise((resolve, reject) => {
                         const script = document.createElement('script');
@@ -554,10 +1212,10 @@
                         script.onload = () => {
                             let retries = 0;
                             const checkInterval = setInterval(() => {
-                                if (window.XLSX) {
+                                if (window.XLSX && window.XLSX.utils && window.XLSX.utils.aoa_to_sheet) {
                                     clearInterval(checkInterval);
                                     resolve();
-                                } else if (++retries > 40) {
+                                } else if (++retries > 50) {
                                     clearInterval(checkInterval);
                                     reject(new Error('XLSX not available'));
                                 }
@@ -571,9 +1229,13 @@
                 }
             }
             
-            updateStatus('✨ Formatting Excel file...', 90);
+            // NOW build the analysis AFTER XLSX is loaded
+            updateStatus('📊 Building relationship intelligence analysis...', 82);
+            const analysisSheet = buildActivitiesAnalysis(unfilteredActivities);
             
-            // Create worksheet
+            updateStatus('✨ Formatting Activities sheet...', 88);
+            
+            // Create Activities worksheet
             const ws = XLSX.utils.json_to_sheet(parsedActivities);
             
             // Get range
@@ -593,7 +1255,7 @@
                         font: {
                             name: 'Arial',
                             sz: 10,
-                            bold: R === 0,  // Bold for header row
+                            bold: R === 0,
                             color: R === 0 ? { rgb: 'FFFFFF' } : { rgb: '000000' }
                         },
                         alignment: {
@@ -602,7 +1264,7 @@
                         }
                     };
                     
-                    // Header row (row 0) - Blue background, white text, bold
+                    // Header row (row 0) - Blue background
                     if (R === 0) {
                         ws[cellRef].s.fill = {
                             patternType: 'solid',
@@ -612,7 +1274,7 @@
                 }
             }
             
-            // Format date columns (D and E are Start Date and End Date)
+            // Format date columns
             for (let row = range.s.r + 1; row <= range.e.r; row++) {
                 ['D', 'E'].forEach(col => {
                     const cellRef = col + (row + 1);
@@ -637,7 +1299,7 @@
             });
             ws['!cols'] = colWidths;
             
-            // Add autofilter to all columns
+            // Add autofilter
             ws['!autofilter'] = { ref: XLSX.utils.encode_range(range) };
             
             // Set row height for header
@@ -647,10 +1309,11 @@
             // Create workbook
             const wb = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wb, ws, 'Activities');
+            XLSX.utils.book_append_sheet(wb, analysisSheet, 'Activities Analysis');
             
             updateStatus('💾 Downloading file...', 95);
             
-            // Generate filename with timestamp
+            // Generate filename
             const timestamp = new Date().toISOString().split('T')[0];
             const filename = `Unanet_Activities_Export_${timestamp}.xlsx`;
             
@@ -659,6 +1322,7 @@
             
             updateStatus(`✅ Export complete! Downloaded: ${filename}`, 100);
             updateStatus(`📊 Total activities exported: ${parsedActivities.length}`, 100);
+            updateStatus(`📈 Analysis generated from ${unfilteredActivities.length} activities`, 100);
             updateStatus('🎉 This window will close in 3 seconds...', 100);
             
             closeDialog();
@@ -669,4 +1333,5 @@
             console.error('Export error:', error);
         }
     }
+    
 })();
