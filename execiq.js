@@ -2804,6 +2804,360 @@ function buildClientAnalysisSheet(rows, schema, config){
 // ─────────────────────────────────────────────────────────────
 // STEP 7: BUILD EXCEL SHEET
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// FORECAST & PIPELINE TIMING SHEET
+// ─────────────────────────────────────────────────────────────
+function buildForecastTimingSheet(rows, schema, config, filterSettings){
+
+  // ── Field label resolver ─────────────────────────────────────
+  function clientLabel(backendKey){
+    var upper = backendKey.toUpperCase();
+    for(var i=0;i<schema.length;i++){
+      if(schema[i].upper===upper||schema[i].backendKey.toUpperCase()===upper)
+        return schema[i].label;
+    }
+    return null;
+  }
+
+  var lbl = {
+    ourFee:   clientLabel("IFIRMFEE")     || "Our Fee",
+    weighted: clientLabel("IFACTOREDFEE") || "Weighted Value",
+    pwin:     clientLabel("IPROBABILITY") || "Pwin",
+    estAward: clientLabel("DTSTARTDATE")  || "Estimated Award Date",
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
+  function fmtPct(v){ if(v==null||v==="") return ""; return (v*100).toFixed(1)+"%"; }
+  function fmtNum(v){ if(v==null||v==="") return ""; return Math.round(v).toLocaleString("en-US"); }
+  function pct(n,d){ return d>0?n/d:null; }
+  function avg(arr,key){ 
+    var vs=arr.filter(function(r){ return r[key]!=null&&r[key]!==""; }); 
+    if(!vs.length) return null; 
+    return vs.reduce(function(t,r){ return t+(parseFloat(r[key])||0); },0)/vs.length; 
+  }
+
+  var today = new Date(); 
+  today.setHours(0,0,0,0);
+
+  // Determine user's forecast window (default 90 days if not specified)
+  var forecastDays = 90; // default
+  if(filterSettings && filterSettings.years !== undefined){
+    if(filterSettings.years === 0) forecastDays = 365; // YTD → rest of year
+    else if(filterSettings.years >= 999) forecastDays = 365; // All Time → 1 year forward
+    else forecastDays = 90; // use 90-day default for historical windows
+  }
+  var forecastEnd = new Date(today.getTime() + forecastDays * 24 * 60 * 60 * 1000);
+
+  // ── Filter to pipeline-eligible active records ───────────────
+  var pipeline = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var active   = pipeline.filter(function(r){ return r["__Status"]==="Active"; });
+
+  // ── Sheet builder ─────────────────────────────────────────────
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY  = "1F3864";
+  var C_BLUE  = "2E75B6";
+  var C_LTBLU = "D6E4F0";
+  var C_WHITE = "FFFFFF";
+  var C_GREEN = "E2EFDA";
+  var C_RED   = "FCE4D6";
+  var C_AMBER = "FFF2CC";
+  var C_ORANGE = "F4B084";
+  var C_DGREY = "F2F2F2";
+
+  function section(title){
+    push([title], {sectionHdr:true});
+  }
+  function tblHdr(cols){
+    push(cols, {tableHdr:true});
+  }
+  function dataRow(cols, fill, bold){
+    push(cols, {fill:fill||null, bold:bold||false});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Forecast & Pipeline Timing", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  push([],{});
+
+  // ══════════════════════════════════════════════════════════════
+  // SECTION 1: MONTHLY FORECAST (Next 12 Months)
+  // ══════════════════════════════════════════════════════════════
+  section("1. MONTHLY FORECAST  (Next 12 Months from " + lbl.estAward + ")");
+  tblHdr(["Month", "Pipeline $", "Weighted $", "# Opps", "Avg " + lbl.pwin]);
+
+  // Build 12-month buckets
+  var monthlyBuckets = [];
+  for(var m=0; m<12; m++){
+    var monthStart = new Date(today.getFullYear(), today.getMonth() + m, 1);
+    var monthEnd   = new Date(today.getFullYear(), today.getMonth() + m + 1, 0, 23, 59, 59);
+    
+    var monthOpps = active.filter(function(r){
+      var v = r[lbl.estAward]; 
+      if(!v) return false;
+      var d = v instanceof Date ? v : new Date(v);
+      return !isNaN(d.getTime()) && d >= monthStart && d <= monthEnd;
+    });
+
+    var monthFee      = monthOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+    var monthWeighted = monthOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.weighted])||0); }, 0);
+    var monthAvgPwin  = avg(monthOpps, lbl.pwin);
+
+    monthlyBuckets.push({
+      label: monthStart.toLocaleDateString("en-US", {month:"short", year:"numeric"}),
+      fee: monthFee,
+      weighted: monthWeighted,
+      count: monthOpps.length,
+      avgPwin: monthAvgPwin
+    });
+  }
+
+  monthlyBuckets.forEach(function(bucket, i){
+    var fill = i%2===0 ? C_WHITE : C_LTBLU;
+    dataRow([
+      bucket.label,
+      fmtCur(bucket.fee),
+      fmtCur(bucket.weighted),
+      fmtNum(bucket.count),
+      fmtPct(bucket.avgPwin)
+    ], fill);
+  });
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SECTION 2: CONFIDENCE BUCKETS (Active Pipeline)
+  // ══════════════════════════════════════════════════════════════
+  section("2. CONFIDENCE BUCKETS  (Active Pipeline by " + lbl.pwin + ")");
+  tblHdr(["Bucket", "Active $", "% of Active Pipeline", "Opp Count", "Avg Deal"]);
+
+  var activeTotalFee = active.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+
+  // High: >70%, Medium: 40-70%, Low: <40%
+  var highConf = active.filter(function(r){
+    var p = r[lbl.pwin]; return p!==null && p!==undefined && p > 0.70;
+  });
+  var medConf = active.filter(function(r){
+    var p = r[lbl.pwin]; return p!==null && p!==undefined && p >= 0.40 && p <= 0.70;
+  });
+  var lowConf = active.filter(function(r){
+    var p = r[lbl.pwin]; return p!==null && p!==undefined && p < 0.40;
+  });
+
+  var highFee = highConf.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var medFee  = medConf.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var lowFee  = lowConf.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+
+  var highPct = pct(highFee, activeTotalFee);
+  var medPct  = pct(medFee, activeTotalFee);
+  var lowPct  = pct(lowFee, activeTotalFee);
+
+  dataRow(["High Confidence (>70%)", fmtCur(highFee), fmtPct(highPct), fmtNum(highConf.length), 
+           fmtCur(pct(highFee, highConf.length))], C_GREEN);
+  dataRow(["Medium Confidence (40-70%)", fmtCur(medFee), fmtPct(medPct), fmtNum(medConf.length),
+           fmtCur(pct(medFee, medConf.length))], C_AMBER);
+  dataRow(["Low Confidence (<40%)", fmtCur(lowFee), fmtPct(lowPct), fmtNum(lowConf.length),
+           fmtCur(pct(lowFee, lowConf.length))], C_RED);
+
+  // Confidence signal
+  spacer();
+  var confSignal, confInsight, confFill;
+  if(highPct !== null && highPct >= 0.50){
+    confSignal = "🟢 High Confidence Dominant";
+    confInsight = "A strong portion of active pipeline is concentrated in high-confidence pursuits.";
+    confFill = C_GREEN;
+  } else if((highPct||0) + (medPct||0) >= 0.60){
+    confSignal = "🟡 Balanced Confidence Mix";
+    confInsight = "Pipeline confidence distribution is balanced across moderate and high-probability opportunities.";
+    confFill = C_AMBER;
+  } else if(medPct !== null && medPct >= 0.50){
+    confSignal = "🟠 Medium Confidence Heavy";
+    confInsight = "Most active pipeline is dependent on moderate-confidence pursuits.";
+    confFill = C_ORANGE;
+  } else {
+    confSignal = "🔴 Low Confidence Dominant";
+    confInsight = "Most active pipeline value is concentrated in low-probability pursuits, reducing forecast reliability.";
+    confFill = C_RED;
+  }
+  push([confSignal, "", "", "", confInsight], {fill:confFill, signalRow:true});
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SECTION 3: SLIPPAGE ANALYSIS (User's forecast window)
+  // ══════════════════════════════════════════════════════════════
+  section("3. SLIPPAGE ANALYSIS  (Opps past " + lbl.estAward + " in " + forecastDays + "-day window)");
+  
+  // Window start = today - forecastDays, window end = today
+  var slippageWindowStart = new Date(today.getTime() - forecastDays * 24 * 60 * 60 * 1000);
+
+  var windowOpps = active.filter(function(r){
+    var v = r[lbl.estAward]; 
+    if(!v) return false;
+    var d = v instanceof Date ? v : new Date(v);
+    return !isNaN(d.getTime()) && d >= slippageWindowStart && d <= today;
+  });
+
+  var slippedOpps = windowOpps.filter(function(r){
+    var v = r[lbl.estAward];
+    var d = v instanceof Date ? v : new Date(v);
+    return d < today; // past due
+  });
+
+  var slippedFee      = slippedOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var slippedWeighted = slippedOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.weighted])||0); }, 0);
+  var slippagePct     = pct(slippedOpps.length, windowOpps.length);
+
+  tblHdr(["Metric", "Value"]);
+  dataRow(["Opps Expected to Close in Window", fmtNum(windowOpps.length)], C_WHITE);
+  dataRow(["Slipped Opp Count", fmtNum(slippedOpps.length)], C_LTBLU);
+  dataRow(["Slipped Pipeline $", fmtCur(slippedFee)], C_WHITE);
+  dataRow(["Slipped Weighted $", fmtCur(slippedWeighted)], C_LTBLU);
+  dataRow(["% Slipped (by count)", fmtPct(slippagePct)], C_WHITE);
+
+  // Slippage signal
+  spacer();
+  var slipSignal, slipInsight, slipFill;
+  if(slippagePct === null || slippagePct < 0.10){
+    slipSignal = "🟢 Healthy Forecast Timing";
+    slipInsight = "Near-term forecast timelines are generally tracking as expected.";
+    slipFill = C_GREEN;
+  } else if(slippagePct < 0.25){
+    slipSignal = "🟡 Moderate Slippage";
+    slipInsight = "Some near-term opportunities have extended beyond expected award timelines.";
+    slipFill = C_AMBER;
+  } else if(slippagePct < 0.40){
+    slipSignal = "🟠 Elevated Slippage Risk";
+    slipInsight = "Several opportunities expected to close recently remain unresolved.";
+    slipFill = C_ORANGE;
+  } else {
+    slipSignal = "🔴 Critical Slippage Risk";
+    slipInsight = "A significant portion of expected near-term awards failed to close on schedule.";
+    slipFill = C_RED;
+  }
+ push([slipSignal, "", "", "", slipInsight], {fill:slipFill, signalRow:true});
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SECTION 4: FORECAST RELIABILITY (Should Close vs Likely Close)
+  // ══════════════════════════════════════════════════════════════
+  section("4. FORECAST RELIABILITY  (" + forecastDays + "-Day Forward Window)");
+
+  // Forward window: today → forecastEnd
+  var forecastWindowOpps = active.filter(function(r){
+    var v = r[lbl.estAward]; 
+    if(!v) return false;
+    var d = v instanceof Date ? v : new Date(v);
+    return !isNaN(d.getTime()) && d >= today && d <= forecastEnd;
+  });
+
+  var shouldClose = forecastWindowOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var likelyClose = forecastWindowOpps.reduce(function(t,r){ return t+(parseFloat(r[lbl.weighted])||0); }, 0);
+  var confidenceRatio = pct(likelyClose, shouldClose);
+
+  tblHdr(["Metric", "Value"]);
+  dataRow(["Should Close (Raw Pipeline $)", fmtCur(shouldClose)], C_WHITE);
+  dataRow(["Likely Close (Weighted Pipeline $)", fmtCur(likelyClose)], C_LTBLU);
+  dataRow(["Confidence Ratio (Likely / Should)", fmtPct(confidenceRatio)], C_WHITE);
+  dataRow(["# Opps in Window", fmtNum(forecastWindowOpps.length)], C_LTBLU);
+
+  // Forecast reliability signal
+  spacer();
+  var relSignal, relInsight, relFill;
+  if(confidenceRatio !== null && confidenceRatio >= 0.70){
+    relSignal = "🟢 Strong Forecast Reliability";
+    relInsight = "Forecast confidence is strong relative to scheduled pipeline volume.";
+    relFill = C_GREEN;
+  } else if(confidenceRatio !== null && confidenceRatio >= 0.50){
+    relSignal = "🟡 Moderate Forecast Reliability";
+    relInsight = "Forecast confidence is moderate and should be monitored for slippage.";
+    relFill = C_AMBER;
+  } else if(confidenceRatio !== null && confidenceRatio >= 0.30){
+    relSignal = "🟠 Weak Forecast Reliability";
+    relInsight = "Weighted pipeline represents a limited portion of scheduled close volume.";
+    relFill = C_ORANGE;
+  } else {
+    relSignal = "🔴 Critical Forecast Reliability Risk";
+    relInsight = "Forecast expectations significantly exceed likely conversion value.";
+    relFill = C_RED;
+  }
+  push([relSignal, "", "", "", relInsight], {fill:relFill, signalRow:true});
+  spacer();
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  var maxCols = 0;
+  aoa.forEach(function(r){ if(r.length>maxCols) maxCols=r.length; });
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var rowFill      = m.fill       || null;
+    var isSectionHdr = m.sectionHdr || false;
+    var isTblHdr     = m.tableHdr   || false;
+    var isTitleRow   = m.titleRow   || false;
+    var isBold       = m.bold       || false;
+    var isSignalRow  = m.signalRow  || false;
+
+    var styleCols = (isSectionHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                  : isTblHdr                    ? Math.max(rowData.length, 1)
+                  : isSignalRow                 ? maxCols
+                  : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold;
+      if(isSectionHdr||isTitleRow){ fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTblHdr){            fill=C_BLUE; fclr="FFFFFF"; fbold=true; }
+      else{                         fill=rowFill; fclr="000000"; fbold=isBold; }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:10, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: { horizontal:"left", vertical:"center", wrapText:false }
+      };
+    }
+  });
+
+  // Merges for section headers, title, and signal rows
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.sectionHdr||m.titleRow||m.signalRow){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)   return {hpt:22};
+    if(m.sectionHdr) return {hpt:18};
+    if(m.tableHdr)   return {hpt:16};
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+  // Column widths
+  ws["!cols"] = [
+    {wch:32}, // A
+    {wch:22}, // B
+    {wch:22}, // C
+    {wch:14}, // D
+    {wch:14}, // E
+    {wch:55}, // F (for signal insights when merged)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+}
+
 function buildOpportunitySheet(rows, schema){
   // Build headers from schema labels, in schema order
   // Include __Status which is always computed
@@ -3052,6 +3406,9 @@ async function main(isRefresh){
 
   UI.log("Building Client Analysis...");
   XLSX.utils.book_append_sheet(wb, buildClientAnalysisSheet(cleanRows, schema, config), "Client Analysis");
+
+UI.log("Building Forecast & Timing...");
+XLSX.utils.book_append_sheet(wb, buildForecastTimingSheet(cleanRows, schema, config, filterSettings), "Forecast & Timing");
 
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
