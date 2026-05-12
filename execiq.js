@@ -2411,7 +2411,7 @@ function buildClientAnalysisSheet(rows, schema, config){
   }
   spacer();
 
-  // ── SECTION D: AT-RISK CLIENTS ───────────────────────────────
+  // ── SECTION E: AT-RISK CLIENTS ───────────────────────────────
   // One row per client — highest severity signal wins.
   // Healthy rows are suppressed; only Watch / Elevated / Critical are shown.
   // Positive signals (High-Efficiency, Strategic) are also shown.
@@ -2600,6 +2600,118 @@ function buildClientAnalysisSheet(rows, schema, config){
            {fill:fill, hasInsight:true});
     });
   }
+
+// ── SECTION D: STRATEGIC CLIENTS & GROWTH OPPORTUNITIES ──────
+  section("E. STRATEGIC CLIENTS & GROWTH OPPORTUNITIES");
+  push(["Client", "Signal", "Severity", "Pipeline $", "Win %", "Insight"],
+       {tableHdr:true, extendToMax:true});
+
+  // Evaluate each client for positive/growth signals
+  var strategicList = [];
+  
+  clientList.forEach(function(c){
+    var winRate         = pct(c.won, c.won+c.lost);
+    var resolved        = c.won + c.lost;
+    var clientActivePct = pct(c.activeFee, activeFee);  // % of total active pipeline
+    var forecastRatio   = pct(c.weightedFee, c.activeFee); // weighted / active
+
+    // Track all qualifying signals for this client
+    var signals = [];
+
+    // 1. STRATEGIC CLIENT
+    // Pipeline > 10% AND Win % > 50%
+    if(clientActivePct !== null && clientActivePct > 0.10 &&
+       winRate !== null && winRate > 0.50){
+      signals.push({
+        type:     "Strategic Client",
+        sev:      "🟢 Positive",
+        insight:  "Client represents a strategically significant account with strong conversion performance.",
+        priority: 1
+      });
+    }
+
+    // 2. HIGH-EFFICIENCY CLIENT
+    // Win % > 60% AND Resolved Opps >= 5
+    if(winRate !== null && winRate > 0.60 && resolved >= 5){
+      signals.push({
+        type:     "High-Efficiency Client",
+        sev:      "🟢 Positive",
+        insight:  "Client demonstrates consistently strong pursuit efficiency.",
+        priority: 2
+      });
+    }
+
+    // 3. GROWTH OPPORTUNITY
+    // Pipeline > 10% AND Resolved Opps < 3
+    if(clientActivePct !== null && clientActivePct > 0.10 && resolved < 3){
+      signals.push({
+        type:     "Growth Opportunity",
+        sev:      "🟡 Watch",
+        insight:  "Client represents a significant growth opportunity with limited historical conversion data.",
+        priority: 3
+      });
+    }
+
+    // 4. FORECAST LEADER
+    // (Weighted / Active) > 70% AND Active Pipeline > $1M
+    if(forecastRatio !== null && forecastRatio > 0.70 &&
+       c.activeFee > 1000000){
+      signals.push({
+        type:     "Forecast Leader",
+        sev:      "🟢 Positive",
+        insight:  "Client portfolio demonstrates strong near-term forecast confidence.",
+        priority: 4
+      });
+    }
+
+    // If any signals qualify, take the highest priority one
+    if(signals.length > 0){
+      // Sort by priority (lower number = higher priority)
+      signals.sort(function(a,b){ return a.priority - b.priority; });
+      var topSignal = signals[0];
+
+      // EXCLUSION LOGIC:
+      // For Growth Opportunity and Forecast Leader:
+      // Suppress if Pipeline < $100K AND Resolved < 3
+      // Strategic and High-Efficiency always show
+      var suppress = false;
+      if(topSignal.priority >= 3){  // Growth Opportunity or Forecast Leader
+        if(c.activeFee < 100000 && resolved < 3){
+          suppress = true;
+        }
+      }
+
+      if(!suppress){
+        strategicList.push({
+          c: c,
+          signal: topSignal.type,
+          sev: topSignal.sev,
+          insight: topSignal.insight,
+          winRate: winRate,
+          priority: topSignal.priority
+        });
+      }
+    }
+  });
+
+  // Sort by priority, then by pipeline $ descending
+  strategicList.sort(function(a,b){
+    if(a.priority !== b.priority) return a.priority - b.priority;
+    return b.c.activeFee - a.c.activeFee;
+  });
+
+  if(strategicList.length === 0){
+    dataRow(["No strategic or growth signals identified."], C_DGREY);
+  } else {
+    strategicList.forEach(function(item){
+      var fill = item.sev === "🟢 Positive" ? C_POSGRN : C_AMBER;
+      push([item.c.name, item.signal, item.sev,
+            fmtCur(item.c.activeFee), fmtPct(item.winRate),
+            item.insight],
+           {fill:fill, hasInsight:true});
+    });
+  }
+  spacer();
 
   // ── Build worksheet ──────────────────────────────────────────
   var ws = XLSX.utils.aoa_to_sheet(aoa);
