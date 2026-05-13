@@ -2867,7 +2867,7 @@ function buildForecastTimingSheet(rows, schema, config, filterSettings){
   var C_GREEN = "E2EFDA";
   var C_RED   = "FCE4D6";
   var C_AMBER = "FFF2CC";
-  var C_ORANGE = "F4B084";
+  var C_ORANGE = "FFEB9C";
   var C_DGREY = "F2F2F2";
 
   function section(title){
@@ -3344,7 +3344,7 @@ function buildPipelineDistributionSheet(rows, schema, config){
   var C_GREEN  = "E2EFDA";
   var C_RED    = "FCE4D6";
   var C_AMBER  = "FFF2CC";
-  var C_ORANGE = "F4B084";
+  var C_ORANGE = "FFEB9C";
   var C_DGREY  = "F2F2F2";
 
   function roleSection(roleName){
@@ -3369,6 +3369,11 @@ function buildPipelineDistributionSheet(rows, schema, config){
     var bTotal = Object.values(roleData[b].people).reduce(function(t,p){ return t+p.pipelineFee; }, 0);
     return bTotal - aTotal;
   });
+
+// Remove roles with no people
+roleIds = roleIds.filter(function(roleId){
+  return Object.keys(roleData[roleId].people).length > 0;
+});
 
   roleIds.forEach(function(roleId){
     var role = roleData[roleId];
@@ -3537,10 +3542,10 @@ function buildPipelineDistributionSheet(rows, schema, config){
     var isTitleRow   = m.titleRow   || false;
     var isBold       = m.bold       || false;
 
-    var styleCols = (isRoleHdr||isTitleRow) ? Math.max(rowData.length, 1)
-                  : isTblHdr                 ? Math.max(rowData.length, 1)
-                  : m.hasInsight             ? maxCols
-                  : Math.max(rowData.length, 1);
+var styleCols = (isRoleHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                : isTblHdr                 ? maxCols
+                : m.hasInsight             ? maxCols
+                : Math.max(rowData.length, 1);
 
     for(var ci=0; ci<styleCols; ci++){
       var addr = XLSX.utils.encode_cell({r:ri, c:ci});
