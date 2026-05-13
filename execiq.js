@@ -3605,6 +3605,507 @@ var styleCols = (isRoleHdr||isTitleRow) ? Math.max(rowData.length, 1)
   return ws;
 }
 
+// ─────────────────────────────────────────────────────────────
+// PIPELINE INTELLIGENCE SHEET
+// Sections: Velocity/Aging, Quality Distribution, Slippage,
+//           Stagnation Heatmap, Pursuit Load vs Quality
+// ─────────────────────────────────────────────────────────────
+function buildPipelineIntelligenceSheet(rows, schema, config){
+
+  // ── Field label resolver ─────────────────────────────────────
+  function clientLabel(backendKey){
+    var upper = backendKey.toUpperCase();
+    for(var i=0;i<schema.length;i++){
+      if(schema[i].upper===upper||schema[i].backendKey.toUpperCase()===upper)
+        return schema[i].label;
+    }
+    return null;
+  }
+
+  var lbl = {
+    ourFee:      clientLabel("IFIRMFEE")     || "Our Fee",
+    daysInStage: clientLabel("DAYSINSTAGE")  || "Days in Stage",
+    stage:       clientLabel("STAGENAME")    || "Stage",
+    pwin:        clientLabel("PWIN")         || "Pwin",
+    owner:       clientLabel("OWNER")        || "Owner",
+    awardDate:   clientLabel("ESTIMATEDAWARDDATE") || "Estimated Award Date",
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
+  function fmtPct(v){ if(v==null||v==="") return ""; return (v*100).toFixed(1)+"%"; }
+  function fmtNum(v){ if(v==null||v==="") return ""; return Math.round(v).toLocaleString("en-US"); }
+  function pct(n,d){ return d>0?n/d:null; }
+  function median(arr){
+    if(!arr.length) return null;
+    var sorted = arr.slice().sort(function(a,b){ return a-b; });
+    var mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid-1] + sorted[mid]) / 2 : sorted[mid];
+  }
+  function parseDate(v){
+    if(!v) return null;
+    var d = new Date(v);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // ── Filter to pipeline-eligible records ──────────────────────
+  var pipeline = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var active   = pipeline.filter(function(r){ return r["__Status"]==="Active"; });
+
+  var today = new Date();
+  today.setHours(0,0,0,0);
+
+  // ── Sheet builder ─────────────────────────────────────────────
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY  = "1F3864";
+  var C_BLUE  = "2E75B6";
+  var C_LTBLU = "D6E4F0";
+  var C_WHITE = "FFFFFF";
+  var C_GREEN = "E2EFDA";
+  var C_RED   = "FCE4D6";
+  var C_AMBER = "FFF2CC";
+  var C_ORANGE= "FFEB9C";
+  var C_DGREY = "F2F2F2";
+
+  function section(title){
+    push([title], {sectionHdr:true});
+  }
+  function tblHdr(cols){
+    push(cols, {tableHdr:true});
+  }
+  function dataRow(cols, fill, bold){
+    push(cols, {fill:fill||null, bold:bold||false});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Pipeline Intelligence", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // 1. PIPELINE VELOCITY & AGING
+  // ══════════════════════════════════════════════════════════════
+  section("1. PIPELINE VELOCITY & AGING");
+  tblHdr(["Stage", "Active Opps", "Avg Days", "Median Days", "Oldest Opp", "Stagnant %", "Signal", "Insight"]);
+
+  // Build stage aggregates
+  var stages = {};
+  active.forEach(function(r){
+    var stageName = String(r[lbl.stage]||"Unknown").trim();
+    var days = parseFloat(r[lbl.daysInStage]);
+    if(!stages[stageName]){
+      stages[stageName] = { name:stageName, opps:[], days:[] };
+    }
+    stages[stageName].opps.push(r);
+    if(!isNaN(days)) stages[stageName].days.push(days);
+  });
+
+  var stageList = Object.values(stages);
+  stageList.forEach(function(stage){
+    stage.count      = stage.opps.length;
+    stage.avgDays    = stage.days.length ? stage.days.reduce(function(t,v){ return t+v; },0) / stage.days.length : null;
+    stage.medianDays = median(stage.days);
+    stage.oldestDays = stage.days.length ? Math.max.apply(null, stage.days) : null;
+    
+    // Stagnant % (days > 2× median)
+    if(stage.medianDays !== null && stage.medianDays > 0){
+      var stagnantCount = stage.opps.filter(function(r){
+        var d = parseFloat(r[lbl.daysInStage]);
+        return !isNaN(d) && d > (2 * stage.medianDays);
+      }).length;
+      stage.stagnantPct = pct(stagnantCount, stage.count);
+    } else {
+      stage.stagnantPct = null;
+    }
+  });
+
+  stageList.sort(function(a,b){ return b.count - a.count; });
+
+  // Find bottleneck (highest median duration)
+  var bottleneckStage = stageList.reduce(function(max, s){
+    return (s.medianDays !== null && (max === null || s.medianDays > max.medianDays)) ? s : max;
+  }, null);
+
+  // Calculate org avg median for healthy flow comparison
+  var allMedians = stageList.map(function(s){ return s.medianDays; }).filter(function(v){ return v!==null; });
+  var orgAvgMedian = allMedians.length ? allMedians.reduce(function(t,v){ return t+v; },0) / allMedians.length : null;
+
+  stageList.forEach(function(stage, i){
+    var signal, insight, fill;
+
+    if(bottleneckStage && stage.name === bottleneckStage.name){
+      signal  = "🔴 Bottleneck Stage";
+      insight = "This stage represents the primary operational bottleneck within the active pipeline.";
+      fill    = C_RED;
+    } else if(stage.stagnantPct !== null && stage.stagnantPct >= 0.40){
+      signal  = "🔴 Aging Risk";
+      insight = "A significant portion of opportunities in this stage exceed expected progression timelines.";
+      fill    = C_RED;
+    } else if(stage.medianDays !== null && orgAvgMedian !== null && stage.medianDays < orgAvgMedian){
+      signal  = "🟢 Healthy Flow";
+      insight = "Pipeline progression through this stage remains operationally healthy.";
+      fill    = C_GREEN;
+    } else {
+      signal  = "—";
+      insight = "—";
+      fill    = i%2===0 ? C_WHITE : C_LTBLU;
+    }
+
+    push([
+      stage.name,
+      fmtNum(stage.count),
+      stage.avgDays !== null ? fmtNum(stage.avgDays) : "—",
+      stage.medianDays !== null ? fmtNum(stage.medianDays) : "—",
+      stage.oldestDays !== null ? fmtNum(stage.oldestDays) : "—",
+      fmtPct(stage.stagnantPct),
+      signal,
+      insight
+    ], {fill:fill, hasInsight:true});
+  });
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // 2. PIPELINE QUALITY DISTRIBUTION
+  // ══════════════════════════════════════════════════════════════
+  section("2. PIPELINE QUALITY DISTRIBUTION");
+  tblHdr(["Confidence Bucket", "Opps", "Active $", "Weighted $", "Avg Days", "Signal", "Insight"]);
+
+  var buckets = {
+    high:   {label:"High (>70%)",      opps:[], min:0.70, max:1.00},
+    medium: {label:"Medium (40-70%)",  opps:[], min:0.40, max:0.70},
+    low:    {label:"Low (<40%)",       opps:[], min:0.00, max:0.40}
+  };
+
+  active.forEach(function(r){
+    var pwin = parseFloat(r[lbl.pwin]);
+    if(isNaN(pwin)) pwin = 0;
+    if(pwin > 0.70)                    buckets.high.opps.push(r);
+    else if(pwin >= 0.40 && pwin <= 0.70) buckets.medium.opps.push(r);
+    else                               buckets.low.opps.push(r);
+  });
+
+  var totalActiveFee = active.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+
+  ["high","medium","low"].forEach(function(key, i){
+    var bucket = buckets[key];
+    var count  = bucket.opps.length;
+    var activeFee = bucket.opps.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+    var weightedFee = bucket.opps.reduce(function(t,r){
+      var fee = parseFloat(r[lbl.ourFee]) || 0;
+      var pw  = parseFloat(r[lbl.pwin]) || 0;
+      return t + (fee * pw);
+    }, 0);
+    var allDays = bucket.opps.map(function(r){ return parseFloat(r[lbl.daysInStage]); }).filter(function(d){ return !isNaN(d); });
+    var avgDays = allDays.length ? allDays.reduce(function(t,v){ return t+v; },0) / allDays.length : null;
+
+    var pctOfActive = pct(activeFee, totalActiveFee);
+    var signal, insight, fill;
+
+    if(i===0){
+      // Show portfolio-level signal on first row only
+      var lowPct = pct(buckets.low.opps.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0), totalActiveFee);
+      var highMedPct = 1 - (lowPct || 0);
+
+      if(lowPct !== null && lowPct >= 0.50){
+        signal  = "🔴 Low Confidence Exposure";
+        insight = "Most active pipeline value depends on lower-probability pursuits.";
+        fill    = C_RED;
+      } else if(highMedPct >= 0.70){
+        signal  = "🟢 Strong Forecast Quality";
+        insight = "Pipeline confidence distribution supports a healthy forecast outlook.";
+        fill    = C_GREEN;
+      } else {
+        signal  = "—";
+        insight = "—";
+        fill    = i%2===0 ? C_WHITE : C_LTBLU;
+      }
+    } else {
+      signal  = "—";
+      insight = "—";
+      fill    = i%2===0 ? C_WHITE : C_LTBLU;
+    }
+
+    push([
+      bucket.label,
+      fmtNum(count),
+      fmtCur(activeFee),
+      fmtCur(weightedFee),
+      avgDays !== null ? fmtNum(avgDays) : "—",
+      signal,
+      insight
+    ], {fill:fill, hasInsight: i===0});
+  });
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // 3. SLIPPAGE SNAPSHOT
+  // ══════════════════════════════════════════════════════════════
+  section("3. SLIPPAGE SNAPSHOT");
+  tblHdr(["Stage", "Slipped Opps", "Slipped $", "Avg Delay Days", "Signal", "Insight"]);
+
+  var slipped = active.filter(function(r){
+    var awardDt = parseDate(r[lbl.awardDate]);
+    return awardDt !== null && awardDt < today;
+  });
+
+  var slippageByStage = {};
+  slipped.forEach(function(r){
+    var stageName = String(r[lbl.stage]||"Unknown").trim();
+    var awardDt   = parseDate(r[lbl.awardDate]);
+    var delayDays = Math.floor((today - awardDt) / (1000*60*60*24));
+    
+    if(!slippageByStage[stageName]){
+      slippageByStage[stageName] = { name:stageName, opps:[], fee:0, delays:[] };
+    }
+    slippageByStage[stageName].opps.push(r);
+    slippageByStage[stageName].fee += (parseFloat(r[lbl.ourFee])||0);
+    slippageByStage[stageName].delays.push(delayDays);
+  });
+
+  var slippageList = Object.values(slippageByStage).sort(function(a,b){ return b.fee - a.fee; });
+  var totalSlippedFee = slipped.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var slippedPctOfActive = pct(totalSlippedFee, totalActiveFee);
+
+  if(slippageList.length === 0){
+    dataRow(["No slipped opportunities in this data set."], C_DGREY);
+  } else {
+    slippageList.forEach(function(stage, i){
+      var avgDelay = stage.delays.length ? stage.delays.reduce(function(t,v){ return t+v; },0) / stage.delays.length : null;
+      var signal, insight, fill;
+
+      if(i === 0){
+        // Portfolio-level signal on first row
+        if(slippedPctOfActive !== null && slippedPctOfActive >= 0.30){
+          signal  = "🔴 Forecast Slippage Risk";
+          insight = "A significant portion of scheduled pipeline remains unresolved beyond expected close dates.";
+          fill    = C_RED;
+        } else if(slippageList.length > 0 && slippageList[0].opps.length > (slipped.length * 0.5)){
+          signal  = "🟠 Stage-Specific Slippage";
+          insight = "Forecast delays appear concentrated within this stage.";
+          fill    = C_ORANGE;
+        } else {
+          signal  = "—";
+          insight = "—";
+          fill    = i%2===0 ? C_WHITE : C_LTBLU;
+        }
+      } else {
+        signal  = "—";
+        insight = "—";
+        fill    = i%2===0 ? C_WHITE : C_LTBLU;
+      }
+
+      push([
+        stage.name,
+        fmtNum(stage.opps.length),
+        fmtCur(stage.fee),
+        avgDelay !== null ? fmtNum(avgDelay) : "—",
+        signal,
+        insight
+      ], {fill:fill, hasInsight: i===0});
+    });
+  }
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // 4. STAGNATION HEATMAP
+  // ══════════════════════════════════════════════════════════════
+  section("4. STAGNATION HEATMAP");
+  tblHdr(["Stage", "<30 Days", "30-60", "60-90", "90+", "Signal", "Insight"]);
+
+  stageList.forEach(function(stage, i){
+    var buckets = {lt30:0, d30_60:0, d60_90:0, d90plus:0};
+    stage.opps.forEach(function(r){
+      var days = parseFloat(r[lbl.daysInStage]);
+      if(isNaN(days)) return;
+      if(days < 30)                buckets.lt30++;
+      else if(days >= 30 && days < 60)  buckets.d30_60++;
+      else if(days >= 60 && days < 90)  buckets.d60_90++;
+      else                         buckets.d90plus++;
+    });
+
+    var total = buckets.lt30 + buckets.d30_60 + buckets.d60_90 + buckets.d90plus;
+    var pct90plus = pct(buckets.d90plus, total);
+    var pctUnder60 = pct(buckets.lt30 + buckets.d30_60, total);
+
+    var signal, insight, fill;
+    if(pct90plus !== null && pct90plus >= 0.40){
+      signal  = "🔴 Severe Aging Risk";
+      insight = "Pipeline aging is materially elevated within this stage.";
+      fill    = C_RED;
+    } else if(pctUnder60 !== null && pctUnder60 >= 0.70){
+      signal  = "🟢 Healthy Distribution";
+      insight = "Pipeline age distribution remains operationally healthy.";
+      fill    = C_GREEN;
+    } else {
+      signal  = "—";
+      insight = "—";
+      fill    = i%2===0 ? C_WHITE : C_LTBLU;
+    }
+
+    push([
+      stage.name,
+      fmtNum(buckets.lt30),
+      fmtNum(buckets.d30_60),
+      fmtNum(buckets.d60_90),
+      fmtNum(buckets.d90plus),
+      signal,
+      insight
+    ], {fill:fill, hasInsight:true});
+  });
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // 5. PURSUIT LOAD vs QUALITY
+  // ══════════════════════════════════════════════════════════════
+  section("5. PURSUIT LOAD vs QUALITY");
+  tblHdr(["Owner", "Opp Count", "Avg Pwin", "Stagnant %", "Signal", "Insight"]);
+
+  var owners = {};
+  active.forEach(function(r){
+    var ownerName = String(r[lbl.owner]||"Unassigned").trim();
+    var pwin = parseFloat(r[lbl.pwin]);
+    if(isNaN(pwin)) pwin = 0;
+    var days = parseFloat(r[lbl.daysInStage]);
+
+    if(!owners[ownerName]){
+      owners[ownerName] = { name:ownerName, opps:[], pwins:[], days:[], fee:0, weightedFee:0 };
+    }
+    owners[ownerName].opps.push(r);
+    owners[ownerName].pwins.push(pwin);
+    if(!isNaN(days)) owners[ownerName].days.push(days);
+    owners[ownerName].fee += (parseFloat(r[lbl.ourFee])||0);
+    owners[ownerName].weightedFee += (parseFloat(r[lbl.ourFee])||0) * pwin;
+  });
+
+  var ownerList = Object.values(owners);
+  ownerList.forEach(function(owner){
+    owner.count    = owner.opps.length;
+    owner.avgPwin  = owner.pwins.length ? owner.pwins.reduce(function(t,v){ return t+v; },0) / owner.pwins.length : null;
+    owner.medianDays = median(owner.days);
+    
+    // Stagnant %
+    if(owner.medianDays !== null && owner.medianDays > 0){
+      var stagnantCount = owner.opps.filter(function(r){
+        var d = parseFloat(r[lbl.daysInStage]);
+        return !isNaN(d) && d > (2 * owner.medianDays);
+      }).length;
+      owner.stagnantPct = pct(stagnantCount, owner.count);
+    } else {
+      owner.stagnantPct = null;
+    }
+
+    owner.weightedRatio = pct(owner.weightedFee, owner.fee);
+  });
+
+  ownerList.sort(function(a,b){ return b.count - a.count; });
+
+  ownerList.forEach(function(owner, i){
+    var signal, insight, fill;
+
+    if(owner.count >= 10 && owner.weightedRatio !== null && owner.weightedRatio < 0.40 && owner.stagnantPct !== null && owner.stagnantPct > 0.30){
+      signal  = "🔴 Overloaded Low-Confidence Portfolio";
+      insight = "Large active portfolio is progressing slowly with limited forecast confidence.";
+      fill    = C_RED;
+    } else {
+      signal  = "—";
+      insight = "—";
+      fill    = i%2===0 ? C_WHITE : C_LTBLU;
+    }
+
+    push([
+      owner.name,
+      fmtNum(owner.count),
+      fmtPct(owner.avgPwin),
+      fmtPct(owner.stagnantPct),
+      signal,
+      insight
+    ], {fill:fill, hasInsight:true});
+  });
+  spacer();
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  var maxCols = 0;
+  aoa.forEach(function(r){ if(r.length>maxCols) maxCols=r.length; });
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var rowFill      = m.fill       || null;
+    var isSectionHdr = m.sectionHdr || false;
+    var isTblHdr     = m.tableHdr   || false;
+    var isTitleRow   = m.titleRow   || false;
+    var isBold       = m.bold       || false;
+
+    var styleCols = (isSectionHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                  : isTblHdr                    ? maxCols
+                  : m.hasInsight                ? maxCols
+                  : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold;
+      if(isSectionHdr||isTitleRow){ fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTblHdr){            fill=C_BLUE; fclr="FFFFFF"; fbold=true; }
+      else{                         fill=rowFill; fclr="000000"; fbold=isBold; }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:10, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: { horizontal:"left", vertical:"center", wrapText:false }
+      };
+    }
+  });
+
+  // Merges for section headers, title, and insight cells
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.sectionHdr||m.titleRow){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+    if(m.hasInsight){
+      var insightCol = aoa[ri].length - 1;
+      if(insightCol >= 5){
+        ws["!merges"].push({s:{r:ri,c:insightCol},e:{r:ri,c:maxCols-1}});
+      }
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)   return {hpt:22};
+    if(m.sectionHdr) return {hpt:18};
+    if(m.tableHdr)   return {hpt:16};
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+// Column widths
+  ws["!cols"] = [
+    {wch:24}, // A — Stage/Bucket/Owner
+    {wch:12}, // B — Count/Opps
+    {wch:12}, // C — Days/$/Metric
+    {wch:12}, // D — Days/$/Metric
+    {wch:12}, // E — Days/$/Metric
+    {wch:12}, // F — Stagnant %/Metric
+    {wch:28}, // G — Signal
+    {wch:65}, // H — Insight (merged)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+}
+
 function buildOpportunitySheet(rows, schema){
   // Build headers from schema labels, in schema order
   // Include __Status which is always computed
@@ -3859,6 +4360,9 @@ XLSX.utils.book_append_sheet(wb, buildForecastTimingSheet(cleanRows, schema, con
 
 UI.log("Building Pipeline Distribution...");
 XLSX.utils.book_append_sheet(wb, buildPipelineDistributionSheet(cleanRows, schema, config), "Pipeline Distribution");
+
+UI.log("Building Pipeline Intelligence...");
+XLSX.utils.book_append_sheet(wb, buildPipelineIntelligenceSheet(cleanRows, schema, config), "Pipeline Intelligence");
 
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
