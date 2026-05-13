@@ -3158,6 +3158,448 @@ function buildForecastTimingSheet(rows, schema, config, filterSettings){
   return ws;
 }
 
+// ─────────────────────────────────────────────────────────────
+// PIPELINE DISTRIBUTION SHEET (Personnel View)
+// Grouped by role, person-level metrics with signals
+// ─────────────────────────────────────────────────────────────
+function buildPipelineDistributionSheet(rows, schema, config){
+
+  // ── Field label resolver ─────────────────────────────────────
+  function clientLabel(backendKey){
+    var upper = backendKey.toUpperCase();
+    for(var i=0;i<schema.length;i++){
+      if(schema[i].upper===upper||schema[i].backendKey.toUpperCase()===upper)
+        return schema[i].label;
+    }
+    return null;
+  }
+
+  var lbl = {
+    ourFee:      clientLabel("IFIRMFEE")     || "Our Fee",
+    weighted:    clientLabel("IFACTOREDFEE") || "Weighted Value",
+    pwin:        clientLabel("IPROBABILITY") || "Pwin",
+    daysInStage: clientLabel("DAYSINSTAGE")  || "Days in Stage",
+    createDate:  clientLabel("CREATEDATE")   || "Date Created",
+    closeDate:   clientLabel("DTCLOSEDATE")  || "Close Date",
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
+  function fmtPct(v){ if(v==null||v==="") return ""; return (v*100).toFixed(1)+"%"; }
+  function fmtNum(v){ if(v==null||v==="") return ""; return Math.round(v).toLocaleString("en-US"); }
+  function pct(n,d){ return d>0?n/d:null; }
+  function avg(arr,key){ 
+    var vs=arr.filter(function(r){ return r[key]!=null&&r[key]!==""; }); 
+    if(!vs.length) return null; 
+    return vs.reduce(function(t,r){ return t+(parseFloat(r[key])||0); },0)/vs.length; 
+  }
+  function sum(arr,key){ 
+    return arr.reduce(function(t,r){ 
+      var v=r[key]; 
+      return t+(v!=null&&v!==""?parseFloat(v)||0:0); 
+    },0); 
+  }
+
+  // ── Filter to pipeline-eligible records ──────────────────────
+  var pipeline = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var active   = pipeline.filter(function(r){ return r["__Status"]==="Active"; });
+
+  // Org-level averages (for signal comparisons)
+  var orgAvgPipeline = pct(sum(active, lbl.ourFee), active.length);
+  var orgAvgDaysInStage = avg(active, lbl.daysInStage);
+
+  // ── Extract all people from STAFFROLE columns ────────────────
+  // Build a map: roleId → roleName → [person names]
+  var roleData = {}; // {roleId: {roleName, people: {personName: {opps:[], ...}}}}
+
+  // First pass: identify all STAFFROLE columns in schema
+  var staffRoleFields = schema.filter(function(f){
+    return f.backendKey && f.backendKey.toUpperCase().startsWith("STAFFROLE_");
+  });
+
+  if(staffRoleFields.length === 0){
+    // No staff role data available
+    var aoa = [
+      ["ExecIQ  |  Pipeline Distribution", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+      [],
+      ["No staff role data available in this extract."]
+    ];
+    var ws = XLSX.utils.aoa_to_sheet(aoa);
+    return ws;
+  }
+
+  // Second pass: extract people from each role column
+  staffRoleFields.forEach(function(field){
+    var roleId = field.backendKey.replace(/^STAFFROLE_/i, "");
+    var roleName = field.label || ("Role " + roleId);
+    
+    if(!roleData[roleId]){
+      roleData[roleId] = {
+        roleName: roleName,
+        people: {}
+      };
+    }
+
+    // Scan all rows for this role column
+    pipeline.forEach(function(row){
+      var personName = row[field.label];
+      if(!personName || personName === "") return;
+      
+      // Initialize person if first time seeing them in this role
+      if(!roleData[roleId].people[personName]){
+        roleData[roleId].people[personName] = {
+          name: personName,
+          opps: []
+        };
+      }
+      
+      // Add this opp to person's list
+      roleData[roleId].people[personName].opps.push(row);
+    });
+  });
+
+  // ── Calculate metrics for each person ────────────────────────
+  Object.keys(roleData).forEach(function(roleId){
+    var role = roleData[roleId];
+    
+    Object.keys(role.people).forEach(function(personName){
+      var person = role.people[personName];
+      var allOpps    = person.opps;
+      var activeOpps = allOpps.filter(function(r){ return r["__Status"]==="Active"; });
+      var wonOpps    = allOpps.filter(function(r){ return r["__Status"]==="Won"; });
+      var lostOpps   = allOpps.filter(function(r){ return r["__Status"]==="Lost"; });
+      var closedOpps = allOpps.filter(function(r){ return r["__Status"]==="Won" || r["__Status"]==="Lost"; });
+
+      // Section 1: Pipeline View
+      person.activeCount  = activeOpps.length;
+      person.pipelineFee  = sum(activeOpps, lbl.ourFee);
+      person.weightedFee  = sum(activeOpps, lbl.weighted);
+      person.avgPwin      = avg(activeOpps, lbl.pwin);
+
+      // Section 2: Conversion Metrics
+      person.wonCount   = wonOpps.length;
+      person.lostCount  = lostOpps.length;
+      person.wonFee     = sum(wonOpps, lbl.ourFee);
+      person.lostFee    = sum(lostOpps, lbl.ourFee);
+      person.winRate    = pct(person.wonCount, person.wonCount + person.lostCount);
+      person.avgWonDeal = pct(person.wonFee, person.wonCount);
+
+      // Section 3: Efficiency Metrics
+      person.avgDaysInStage = avg(activeOpps, lbl.daysInStage);
+      
+      // Avg Deal Cycle Time (closed opps only)
+      var cycleTimes = closedOpps.map(function(r){
+        var created = r[lbl.createDate];
+        var closed  = r[lbl.closeDate];
+        if(!created || !closed) return null;
+        var c1 = created instanceof Date ? created : new Date(created);
+        var c2 = closed  instanceof Date ? closed  : new Date(closed);
+        if(isNaN(c1.getTime()) || isNaN(c2.getTime())) return null;
+        return (c2.getTime() - c1.getTime()) / (1000*60*60*24); // days
+      }).filter(function(v){ return v !== null; });
+      person.avgCycleTime = cycleTimes.length > 0 
+        ? cycleTimes.reduce(function(t,v){ return t+v; }, 0) / cycleTimes.length 
+        : null;
+
+      // Stagnant opps (current stage duration > 2× median for that stage)
+      // Calculate stage medians from ALL active opps across org
+      var stageMedians = {};
+      active.forEach(function(r){
+        var stage = r["__Stage"];
+        var days  = parseFloat(r[lbl.daysInStage]);
+        if(!stage || days == null) return;
+        if(!stageMedians[stage]) stageMedians[stage] = [];
+        stageMedians[stage].push(days);
+      });
+      Object.keys(stageMedians).forEach(function(stage){
+        var arr = stageMedians[stage].sort(function(a,b){ return a-b; });
+        var mid = Math.floor(arr.length / 2);
+        stageMedians[stage] = arr.length % 2 === 0 
+          ? (arr[mid-1] + arr[mid]) / 2 
+          : arr[mid];
+      });
+
+      person.stagnantCount = activeOpps.filter(function(r){
+        var stage = r["__Stage"];
+        var days  = parseFloat(r[lbl.daysInStage]);
+        if(!stage || days == null) return false;
+        var median = stageMedians[stage];
+        return median && days > (2 * median);
+      }).length;
+      person.stagnantPct = pct(person.stagnantCount, person.activeCount);
+    });
+  });
+
+  // ── Sheet builder ─────────────────────────────────────────────
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY   = "1F3864";
+  var C_BLUE   = "2E75B6";
+  var C_LTBLU  = "D6E4F0";
+  var C_WHITE  = "FFFFFF";
+  var C_GREEN  = "E2EFDA";
+  var C_RED    = "FCE4D6";
+  var C_AMBER  = "FFF2CC";
+  var C_ORANGE = "F4B084";
+  var C_DGREY  = "F2F2F2";
+
+  function roleSection(roleName){
+    push([roleName], {roleHdr:true});
+  }
+  function tblHdr(cols){
+    push(cols, {tableHdr:true});
+  }
+  function dataRow(cols, fill, bold){
+    push(cols, {fill:fill||null, bold:bold||false});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Pipeline Distribution", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  spacer();
+
+  // ── Render each role as a section ────────────────────────────
+  var roleIds = Object.keys(roleData).sort(function(a,b){
+    // Sort by total pipeline $ descending across all people in role
+    var aTotal = Object.values(roleData[a].people).reduce(function(t,p){ return t+p.pipelineFee; }, 0);
+    var bTotal = Object.values(roleData[b].people).reduce(function(t,p){ return t+p.pipelineFee; }, 0);
+    return bTotal - aTotal;
+  });
+
+  roleIds.forEach(function(roleId){
+    var role = roleData[roleId];
+    var peopleList = Object.values(role.people).sort(function(a,b){
+      return b.pipelineFee - a.pipelineFee; // sort by pipeline $ desc
+    });
+
+    // ── SECTION 1: PIPELINE VIEW ──────────────────────────────
+    roleSection(role.roleName + " — PIPELINE VIEW");
+    tblHdr(["Person", "Active Opps", "Pipeline $", "Weighted $", "Avg Pwin", "Signal", "Insight"]);
+
+    peopleList.forEach(function(person, i){
+      var signal, insight, fill;
+
+      // Signal logic from spec
+      if(person.pipelineFee >= orgAvgPipeline && person.avgPwin !== null && person.avgPwin >= 0.50){
+        signal  = "🟢 Strategic Portfolio Owner";
+        insight = "Portfolio demonstrates strong pipeline value and healthy forecast confidence.";
+        fill    = C_GREEN;
+      } else if(person.avgPwin !== null && person.avgPwin >= 0.35 && person.avgPwin < 0.50){
+        signal  = "🟡 Moderate Confidence Portfolio";
+        insight = "Pipeline confidence is moderate relative to active opportunity volume.";
+        fill    = C_AMBER;
+      } else if(person.avgPwin !== null && person.avgPwin < 0.35 && person.pipelineFee >= orgAvgPipeline){
+        signal  = "🟠 Low Forecast Confidence";
+        insight = "Large portions of active pipeline are dependent on lower-confidence pursuits.";
+        fill    = C_ORANGE;
+      } else if(person.weightedFee > 0 && pct(person.weightedFee, person.pipelineFee) !== null && 
+                pct(person.weightedFee, person.pipelineFee) < 0.25 && person.activeCount >= 5){
+        signal  = "🔴 Underdeveloped Pipeline";
+        insight = "Pipeline volume is not translating into forecast confidence.";
+        fill    = C_RED;
+      } else {
+        signal  = "—";
+        insight = "—";
+        fill    = i%2===0 ? C_WHITE : C_LTBLU;
+      }
+
+      push([
+        person.name,
+        fmtNum(person.activeCount),
+        fmtCur(person.pipelineFee),
+        fmtCur(person.weightedFee),
+        fmtPct(person.avgPwin),
+        signal,
+        insight
+      ], {fill:fill, hasInsight:true});
+    });
+    spacer();
+
+    // ── SECTION 2: CONVERSION METRICS ─────────────────────────
+    // Only show people with 5+ closed opps (per spec)
+    var peopleWithHistory = peopleList.filter(function(p){ 
+      return (p.wonCount + p.lostCount) >= 5; 
+    });
+
+    if(peopleWithHistory.length > 0){
+      roleSection(role.roleName + " — CONVERSION METRICS");
+      tblHdr(["Person", "Win Rate", "Won $", "Lost $", "Signal", "Insight"]);
+
+      peopleWithHistory.forEach(function(person, i){
+        var signal, insight, fill;
+
+        if(person.winRate !== null && person.winRate >= 0.60 && person.wonFee >= orgAvgPipeline){
+          signal  = "🟢 High Conversion Performance";
+          insight = "Portfolio demonstrates consistently strong conversion performance.";
+          fill    = C_GREEN;
+        } else if(person.winRate !== null && person.winRate >= 0.50 && person.lostFee < orgAvgPipeline){
+          signal  = "🟢 Efficient Pursuit Portfolio";
+          insight = "Pursuit activity is converting efficiently relative to portfolio losses.";
+          fill    = C_GREEN;
+        } else if(person.winRate !== null && person.winRate >= 0.35 && person.winRate < 0.50){
+          signal  = "🟡 Moderate Conversion Performance";
+          insight = "Conversion performance is moderate relative to organizational averages.";
+          fill    = C_AMBER;
+        } else if(person.lostFee > orgAvgPipeline && person.winRate !== null && person.winRate < 0.30){
+          signal  = "🟠 Low Conversion Efficiency";
+          insight = "Pursuit effort is generating limited realized conversion value.";
+          fill    = C_ORANGE;
+        } else if(person.winRate !== null && person.winRate < 0.20 && (person.wonCount + person.lostCount) >= 8){
+          signal  = "🔴 Pursuit Inefficiency Risk";
+          insight = "High pursuit activity has produced consistently weak conversion performance.";
+          fill    = C_RED;
+        } else {
+          signal  = "—";
+          insight = "—";
+          fill    = i%2===0 ? C_WHITE : C_LTBLU;
+        }
+
+        push([
+          person.name,
+          fmtPct(person.winRate),
+          fmtCur(person.wonFee),
+          fmtCur(person.lostFee),
+          signal,
+          insight
+        ], {fill:fill, hasInsight:true});
+      });
+      spacer();
+    }
+
+    // ── SECTION 3: EFFICIENCY METRICS ─────────────────────────
+    roleSection(role.roleName + " — EFFICIENCY METRICS");
+    tblHdr(["Person", "Avg Days in Stage", "Avg Deal Cycle", "Stagnant Opps", "Signal", "Insight"]);
+
+    peopleList.forEach(function(person, i){
+      var signal, insight, fill;
+
+      if(person.avgDaysInStage !== null && orgAvgDaysInStage !== null &&
+         person.avgDaysInStage < orgAvgDaysInStage && person.stagnantPct !== null && person.stagnantPct < 0.20){
+        signal  = "🟢 Efficient Pipeline Management";
+        insight = "Pipeline is progressing efficiently through active pursuit stages.";
+        fill    = C_GREEN;
+      } else if(person.avgDaysInStage !== null && orgAvgDaysInStage !== null &&
+                person.avgDaysInStage > orgAvgDaysInStage && person.avgDaysInStage < (orgAvgDaysInStage * 1.15)){
+        signal  = "🟡 Moderate Pipeline Velocity";
+        insight = "Pipeline progression is moderately slower than organizational benchmarks.";
+        fill    = C_AMBER;
+      } else if(person.avgDaysInStage !== null && orgAvgDaysInStage !== null &&
+                person.avgDaysInStage > (orgAvgDaysInStage * 1.25)){
+        signal  = "🟠 Stage Aging Risk";
+        insight = "Pipeline progression appears slower than expected across active pursuits.";
+        fill    = C_ORANGE;
+      } else if(person.stagnantPct !== null && person.stagnantPct >= 0.40){
+        signal  = "🔴 Stagnation Risk";
+        insight = "A significant portion of active opportunities have stalled beyond expected timelines.";
+        fill    = C_RED;
+      } else if(person.activeCount >= 8 && person.avgDaysInStage !== null && orgAvgDaysInStage !== null &&
+                person.avgDaysInStage > orgAvgDaysInStage && person.weightedFee > 0 &&
+                pct(person.weightedFee, person.pipelineFee) !== null && 
+                pct(person.weightedFee, person.pipelineFee) < 0.30){
+        signal  = "🔴 Oversized Low-Velocity Portfolio";
+        insight = "Large active portfolio is progressing slowly with limited forecast confidence.";
+        fill    = C_RED;
+      } else {
+        signal  = "—";
+        insight = "—";
+        fill    = i%2===0 ? C_WHITE : C_LTBLU;
+      }
+
+      push([
+        person.name,
+        person.avgDaysInStage !== null ? fmtNum(person.avgDaysInStage) : "—",
+        person.avgCycleTime !== null ? fmtNum(person.avgCycleTime) : "—",
+        fmtNum(person.stagnantCount) + " (" + fmtPct(person.stagnantPct) + ")",
+        signal,
+        insight
+      ], {fill:fill, hasInsight:true});
+    });
+    spacer();
+    spacer(); // Extra space between roles
+  });
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  var maxCols = 0;
+  aoa.forEach(function(r){ if(r.length>maxCols) maxCols=r.length; });
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var rowFill      = m.fill       || null;
+    var isRoleHdr    = m.roleHdr    || false;
+    var isTblHdr     = m.tableHdr   || false;
+    var isTitleRow   = m.titleRow   || false;
+    var isBold       = m.bold       || false;
+
+    var styleCols = (isRoleHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                  : isTblHdr                 ? Math.max(rowData.length, 1)
+                  : m.hasInsight             ? maxCols
+                  : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold;
+      if(isRoleHdr){              fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTitleRow){        fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTblHdr){          fill=C_BLUE; fclr="FFFFFF"; fbold=true; }
+      else{                       fill=rowFill; fclr="000000"; fbold=isBold; }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:10, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: { horizontal:"left", vertical:"center", wrapText:false }
+      };
+    }
+  });
+
+  // Merges for role headers, title, and insight cells
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.roleHdr||m.titleRow){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+    if(m.hasInsight){
+      var insightCol = aoa[ri].length - 1;
+      if(insightCol >= 5){
+        ws["!merges"].push({s:{r:ri,c:insightCol},e:{r:ri,c:maxCols-1}});
+      }
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)   return {hpt:22};
+    if(m.roleHdr)    return {hpt:18};
+    if(m.tableHdr)   return {hpt:16};
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+  // Column widths
+  ws["!cols"] = [
+    {wch:28}, // A — person name
+    {wch:14}, // B — metric 1
+    {wch:18}, // C — metric 2
+    {wch:18}, // D — metric 3
+    {wch:14}, // E — metric 4 / signal
+    {wch:24}, // F — signal
+    {wch:55}, // G — insight (merged)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+}
+
 function buildOpportunitySheet(rows, schema){
   // Build headers from schema labels, in schema order
   // Include __Status which is always computed
@@ -3409,6 +3851,9 @@ async function main(isRefresh){
 
 UI.log("Building Forecast & Timing...");
 XLSX.utils.book_append_sheet(wb, buildForecastTimingSheet(cleanRows, schema, config, filterSettings), "Forecast & Timing");
+
+UI.log("Building Pipeline Distribution...");
+XLSX.utils.book_append_sheet(wb, buildPipelineDistributionSheet(cleanRows, schema, config), "Pipeline Distribution");
 
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
