@@ -4106,6 +4106,389 @@ function buildPipelineIntelligenceSheet(rows, schema, config){
   return ws;
 }
 
+// ─────────────────────────────────────────────────────────────
+// MARKET INTELLIGENCE SHEET
+// Business unit analysis by Firm Org and Opportunity Role
+// ─────────────────────────────────────────────────────────────
+function buildMarketIntelligenceSheet(rows, schema, config){
+
+  // ── Field label resolver ─────────────────────────────────────
+  function clientLabel(backendKey){
+    var upper = backendKey.toUpperCase();
+    for(var i=0;i<schema.length;i++){
+      if(schema[i].upper===upper||schema[i].backendKey.toUpperCase()===upper)
+        return schema[i].label;
+    }
+    return null;
+  }
+
+  var lbl = {
+    ourFee:    clientLabel("IFIRMFEE")     || "Our Fee",
+    pwin:      clientLabel("PWIN")         || "Pwin",
+    oppRole:   clientLabel("OPPORTUNITYROLE") || "Opportunity Role",
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────
+  function fmtCur(v){ if(v==null||v==="") return ""; return "$"+Math.round(v).toLocaleString("en-US"); }
+  function fmtPct(v){ if(v==null||v==="") return ""; return (v*100).toFixed(1)+"%"; }
+  function fmtNum(v){ if(v==null||v==="") return ""; return Math.round(v).toLocaleString("en-US"); }
+  function pct(n,d){ return d>0?n/d:null; }
+  function median(arr){
+    if(!arr.length) return null;
+    var sorted = arr.slice().sort(function(a,b){ return a-b; });
+    var mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid-1] + sorted[mid]) / 2 : sorted[mid];
+  }
+
+  // ── Filter to pipeline-eligible records ──────────────────────
+  var pipeline = rows.filter(function(r){ return r["__InPipeline"] !== false; });
+  var active   = pipeline.filter(function(r){ return r["__Status"]==="Active"; });
+  var won      = pipeline.filter(function(r){ return r["__Status"]==="Won"; });
+  var lost     = pipeline.filter(function(r){ return r["__Status"]==="Lost"; });
+
+  // ── Calculate org-level benchmarks ───────────────────────────
+  var totalActiveFee = active.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+  var avgOrgPipeline = active.length > 0 ? totalActiveFee / active.length : 0;
+
+  var wonDeals = won.map(function(r){ return parseFloat(r[lbl.ourFee])||0; }).filter(function(v){ return v>0; });
+  var orgMedianDeal = median(wonDeals);
+
+  // ── Discover enabled Firm Org fields ──────────────────────────
+  // Find all Firm Org list fields that exist in the schema
+  var FIRM_ORG_FIELDS = ["OFFICELIST", "DIVISIONLIST", "STUDIOLIST", "PRACTICEAREALIST", 
+                         "TERRITORYLIST", "OFFICEDIVISIONLIST"];
+  
+  var firmOrgFields = [];
+  FIRM_ORG_FIELDS.forEach(function(fieldKey){
+    var field = schema.find(function(f){ return f.upper === fieldKey; });
+    if(field){
+      firmOrgFields.push({
+        backendKey: field.backendKey,
+        label: field.label,
+        upper: field.upper
+      });
+    }
+  });
+
+  // ── Build business unit aggregator ───────────────────────────
+  function buildBusinessUnit(fieldLabel, businessUnitName){
+    // Filter records that contain this business unit in the field
+    // Firm Org fields are comma-separated lists
+    var activeFiltered = active.filter(function(r){ 
+      var val = String(r[fieldLabel]||"");
+      return val.split(",").map(function(v){ return v.trim(); }).indexOf(businessUnitName) >= 0;
+    });
+    var wonFiltered = won.filter(function(r){ 
+      var val = String(r[fieldLabel]||"");
+      return val.split(",").map(function(v){ return v.trim(); }).indexOf(businessUnitName) >= 0;
+    });
+    var lostFiltered = lost.filter(function(r){ 
+      var val = String(r[fieldLabel]||"");
+      return val.split(",").map(function(v){ return v.trim(); }).indexOf(businessUnitName) >= 0;
+    });
+
+    var pipelineFee = activeFiltered.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+    var weightedFee = activeFiltered.reduce(function(t,r){
+      var fee = parseFloat(r[lbl.ourFee]) || 0;
+      var pw  = parseFloat(r[lbl.pwin]) || 0;
+      return t + (fee * pw);
+    }, 0);
+
+    var wonCount  = wonFiltered.length;
+    var lostCount = lostFiltered.length;
+    var closedCount = wonCount + lostCount;
+    var winRate = pct(wonCount, closedCount);
+
+    var wonFee = wonFiltered.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+    var avgDeal = pct(wonFee, wonCount);
+
+    var forecastConfidence = pct(weightedFee, pipelineFee);
+
+    return {
+      name: businessUnitName,
+      pipelineFee: pipelineFee,
+      weightedFee: weightedFee,
+      winRate: winRate,
+      avgDeal: avgDeal,
+      forecastConfidence: forecastConfidence,
+      closedCount: closedCount,
+      activeCount: activeFiltered.length
+    };
+  }
+
+  // ── Collect all unique values from each Firm Org field ───────
+  var firmOrgSections = []; // [{fieldLabel, units: [names]}]
+  
+  firmOrgFields.forEach(function(field){
+    var units = {};
+    pipeline.forEach(function(r){
+      var val = String(r[field.label]||"");
+      if(!val || val === "") return;
+      // Split comma-separated values
+      val.split(",").forEach(function(unitName){
+        unitName = unitName.trim();
+        if(unitName && unitName !== "Unknown" && unitName !== "") units[unitName] = true;
+      });
+    });
+    var unitList = Object.keys(units).sort();
+    if(unitList.length > 0){
+      firmOrgSections.push({
+        fieldLabel: field.label,
+        units: unitList
+      });
+    }
+  });
+
+  // ── Collect all Opportunity Roles ────────────────────────────
+  var oppRoles = {};
+  pipeline.forEach(function(r){
+    var role = String(r[lbl.oppRole]||"").trim();
+    if(role && role !== "Unknown" && role !== "") oppRoles[role] = true;
+  });
+  var oppRoleList = Object.keys(oppRoles).sort();
+
+  // ── Sheet builder ─────────────────────────────────────────────
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY  = "1F3864";
+  var C_BLUE  = "2E75B6";
+  var C_LTBLU = "D6E4F0";
+  var C_WHITE = "FFFFFF";
+  var C_GREEN = "E2EFDA";
+  var C_RED   = "FCE4D6";
+  var C_AMBER = "FFF2CC";
+  var C_ORANGE= "FFEB9C";
+  var C_DGREY = "F2F2F2";
+
+  function section(title){
+    push([title], {sectionHdr:true});
+  }
+  function tblHdr(cols){
+    push(cols, {tableHdr:true});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Market Intelligence", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  spacer();
+
+  // ── Generate signals for a business unit ─────────────────────
+  function generateSignals(bu){
+    var signal, insight, fill;
+
+    // Suppress signals if insufficient closed opps
+    if(bu.closedCount < 5){
+      return { signal:"—", insight:"Insufficient closed opportunities for meaningful signal generation.", fill:C_DGREY };
+    }
+
+    // Signal priority logic
+    if(bu.pipelineFee >= avgOrgPipeline && bu.winRate !== null && bu.winRate >= 0.50 && bu.forecastConfidence !== null && bu.forecastConfidence >= 0.50){
+      signal  = "🟢 Strategic Growth Area";
+      insight = "This business unit demonstrates strong pipeline value, healthy conversion performance, and solid forecast confidence.";
+      fill    = C_GREEN;
+    } else if(bu.winRate !== null && bu.winRate >= 0.60 && bu.avgDeal !== null && orgMedianDeal !== null && bu.avgDeal >= orgMedianDeal){
+      signal  = "🟢 High-Efficiency Practice";
+      insight = "This business unit consistently converts high-value pursuits efficiently.";
+      fill    = C_GREEN;
+    } else if(bu.avgDeal !== null && orgMedianDeal !== null && bu.avgDeal >= (orgMedianDeal * 1.25) && bu.winRate !== null && bu.winRate >= 0.35){
+      signal  = "🟢 Large Deal Strength";
+      insight = "This business unit consistently converts larger-than-average pursuit opportunities.";
+      fill    = C_GREEN;
+    } else if(bu.winRate !== null && bu.winRate < 0.20 && bu.pipelineFee >= avgOrgPipeline && bu.closedCount >= 8){
+      signal  = "🔴 Pursuit Efficiency Risk";
+      insight = "Significant pursuit activity has produced limited realized conversion value.";
+      fill    = C_RED;
+    } else if(bu.forecastConfidence !== null && bu.forecastConfidence < 0.25 && bu.pipelineFee >= avgOrgPipeline){
+      signal  = "🔴 Forecast Risk";
+      insight = "Large portions of active pipeline depend on low-probability pursuits.";
+      fill    = C_RED;
+    } else if(bu.winRate !== null && bu.winRate < 0.35){
+      signal  = "🟠 Low Conversion Performance";
+      insight = "Historical conversion performance trails organizational benchmarks.";
+      fill    = C_ORANGE;
+    } else if(bu.forecastConfidence !== null && bu.forecastConfidence >= 0.25 && bu.forecastConfidence < 0.40){
+      signal  = "🟠 Low Forecast Quality";
+      insight = "Pipeline value is weighted toward lower-confidence pursuits.";
+      fill    = C_ORANGE;
+    } else if(bu.avgDeal !== null && orgMedianDeal !== null && bu.avgDeal < (orgMedianDeal * 0.60)){
+      signal  = "🟠 Small Deal Concentration";
+      insight = "Pipeline activity is concentrated in smaller average deal sizes.";
+      fill    = C_ORANGE;
+    } else if(bu.forecastConfidence !== null && bu.forecastConfidence >= 0.40 && bu.forecastConfidence < 0.50){
+      signal  = "🟡 Moderate Forecast Confidence";
+      insight = "Pipeline confidence is moderate relative to active opportunity value.";
+      fill    = C_AMBER;
+    } else {
+      signal  = "—";
+      insight = "—";
+      fill    = C_LTBLU;
+    }
+
+    return { signal:signal, insight:insight, fill:fill };
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // FIRM ORG ANALYSIS (one section per Firm Org type)
+  // ══════════════════════════════════════════════════════════════
+  firmOrgSections.forEach(function(section){
+    push([section.fieldLabel + " Analysis"], {sectionHdr:true});
+    tblHdr([section.fieldLabel, "Pipeline $", "Weighted $", "Win Rate", "Avg Deal", "Signal", "Insight"]);
+
+    section.units.forEach(function(unitName){
+      var bu = buildBusinessUnit(section.fieldLabel, unitName);
+      var sig = generateSignals(bu);
+
+      push([
+        bu.name,
+        fmtCur(bu.pipelineFee),
+        fmtCur(bu.weightedFee),
+        fmtPct(bu.winRate),
+        fmtCur(bu.avgDeal),
+        sig.signal,
+        sig.insight
+      ], {fill:sig.fill, hasInsight:true});
+    });
+
+    spacer();
+  });
+
+  // ══════════════════════════════════════════════════════════════
+  // OPPORTUNITY ROLE ANALYSIS
+  // ══════════════════════════════════════════════════════════════
+  if(oppRoleList.length > 0){
+    section("Opportunity Role Analysis");
+    tblHdr(["Opportunity Role", "Pipeline $", "Weighted $", "Win Rate", "Avg Deal", "Signal", "Insight"]);
+
+    oppRoleList.forEach(function(roleName){
+      // For Opp Role, filter by exact match (not comma-separated)
+      var activeFiltered = active.filter(function(r){ return String(r[lbl.oppRole]||"").trim() === roleName; });
+      var wonFiltered = won.filter(function(r){ return String(r[lbl.oppRole]||"").trim() === roleName; });
+      var lostFiltered = lost.filter(function(r){ return String(r[lbl.oppRole]||"").trim() === roleName; });
+
+      var pipelineFee = activeFiltered.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+      var weightedFee = activeFiltered.reduce(function(t,r){
+        var fee = parseFloat(r[lbl.ourFee]) || 0;
+        var pw  = parseFloat(r[lbl.pwin]) || 0;
+        return t + (fee * pw);
+      }, 0);
+
+      var wonCount  = wonFiltered.length;
+      var lostCount = lostFiltered.length;
+      var closedCount = wonCount + lostCount;
+      var winRate = pct(wonCount, closedCount);
+
+      var wonFee = wonFiltered.reduce(function(t,r){ return t+(parseFloat(r[lbl.ourFee])||0); }, 0);
+      var avgDeal = pct(wonFee, wonCount);
+
+      var forecastConfidence = pct(weightedFee, pipelineFee);
+
+      var bu = {
+        name: roleName,
+        pipelineFee: pipelineFee,
+        weightedFee: weightedFee,
+        winRate: winRate,
+        avgDeal: avgDeal,
+        forecastConfidence: forecastConfidence,
+        closedCount: closedCount,
+        activeCount: activeFiltered.length
+      };
+
+      var sig = generateSignals(bu);
+
+      push([
+        bu.name,
+        fmtCur(bu.pipelineFee),
+        fmtCur(bu.weightedFee),
+        fmtPct(bu.winRate),
+        fmtCur(bu.avgDeal),
+        sig.signal,
+        sig.insight
+      ], {fill:sig.fill, hasInsight:true});
+    });
+    spacer();
+  }
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  var maxCols = 0;
+  aoa.forEach(function(r){ if(r.length>maxCols) maxCols=r.length; });
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var rowFill      = m.fill       || null;
+    var isSectionHdr = m.sectionHdr || false;
+    var isTblHdr     = m.tableHdr   || false;
+    var isTitleRow   = m.titleRow   || false;
+    var isBold       = m.bold       || false;
+
+    var styleCols = (isSectionHdr||isTitleRow) ? Math.max(rowData.length, 1)
+                  : isTblHdr                    ? maxCols
+                  : m.hasInsight                ? maxCols
+                  : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold;
+      if(isSectionHdr||isTitleRow){ fill=C_NAVY; fclr="FFFFFF"; fbold=true; }
+      else if(isTblHdr){            fill=C_BLUE; fclr="FFFFFF"; fbold=true; }
+      else{                         fill=rowFill; fclr="000000"; fbold=isBold; }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:10, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: { horizontal:"left", vertical:"center", wrapText:false }
+      };
+    }
+  });
+
+  // Merges for section headers, title, and insight cells
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.sectionHdr||m.titleRow){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+    if(m.hasInsight){
+      var insightCol = aoa[ri].length - 1;
+      if(insightCol >= 5){
+        ws["!merges"].push({s:{r:ri,c:insightCol},e:{r:ri,c:maxCols-1}});
+      }
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)   return {hpt:22};
+    if(m.sectionHdr) return {hpt:18};
+    if(m.tableHdr)   return {hpt:16};
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+  // Column widths
+  ws["!cols"] = [
+    {wch:28}, // A — Business unit name
+    {wch:16}, // B — Pipeline $
+    {wch:16}, // C — Weighted $
+    {wch:12}, // D — Win Rate
+    {wch:16}, // E — Avg Deal
+    {wch:32}, // F — Signal
+    {wch:70}, // G — Insight (merged)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+}
+
 function buildOpportunitySheet(rows, schema){
   // Build headers from schema labels, in schema order
   // Include __Status which is always computed
@@ -4364,10 +4747,13 @@ XLSX.utils.book_append_sheet(wb, buildPipelineDistributionSheet(cleanRows, schem
 UI.log("Building Pipeline Intelligence...");
 XLSX.utils.book_append_sheet(wb, buildPipelineIntelligenceSheet(cleanRows, schema, config), "Pipeline Intelligence");
 
+UI.log("Building Market Intelligence...");
+XLSX.utils.book_append_sheet(wb, buildMarketIntelligenceSheet(cleanRows, schema, config), "Market Intelligence");
+
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
 
-  UI.log("✓ Workbook ready — 3 sheets", "ls");
+  UI.log("✓ Workbook ready — 7 sheets", "ls");
   UI.prog(100);
   UI.status(cleanRows.length + " opportunities ready for export");
   UI.log("✓ Done — click Export to download.", "ls");
