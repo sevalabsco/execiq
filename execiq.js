@@ -1675,6 +1675,406 @@ function normalizeRecord(opp, schema, config, masterLookup){
   return row;
 }
 
+// ─────────────────────────────────────────────────────────────
+// DOCUMENTATION SHEET
+// Guide to report structure, metrics, and calculations
+// ─────────────────────────────────────────────────────────────
+function buildDocumentationSheet(schema, config, filterSettings){
+  var aoa  = [];
+  var meta = [];
+
+  function push(row, m){ aoa.push(row); meta.push(m||{}); }
+  function spacer(){ push([],{}); }
+
+  var C_NAVY   = "1F3864";
+  var C_BLUE   = "2E75B6";
+  var C_LTBLU  = "D6E4F0";
+  var C_WHITE  = "FFFFFF";
+  var C_GREEN  = "E2EFDA";
+  var C_AMBER  = "FFF2CC";
+  var C_DGREY  = "F2F2F2";
+
+  function section(title){
+    push([title], {sectionHdr:true});
+  }
+  function subsection(title){
+    push([title], {subsectionHdr:true});
+  }
+  function defRow(term, definition){
+    push([term, definition], {defRow:true});
+  }
+  function note(text){
+    push([text], {note:true});
+  }
+
+  // ── TITLE ────────────────────────────────────────────────────
+  push(["ExecIQ  |  Report Documentation", "", "", "", "", "Generated:", new Date().toLocaleString("en-US")],
+    {titleRow:true});
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // REPORT OVERVIEW
+  // ══════════════════════════════════════════════════════════════
+  section("REPORT OVERVIEW");
+  push(["ExecIQ extracts opportunity data from Unanet CRM and generates an executive-level pipeline intelligence report."], {});
+  push(["This report contains 7 sheets, each focused on a different aspect of pipeline health and performance."], {});
+  spacer();
+
+  subsection("Data Source & Filters");
+  defRow("Date Field:", filterSettings.dateFieldLabel || "Date Created");
+  defRow("Time Window:", filterSettings.years >= 999 ? "All Time" : 
+                        filterSettings.years === 0 ? "Current Year (YTD)" :
+                        "Last " + filterSettings.years + " Years");
+  defRow("Total Records:", schema.length + " fields extracted");
+  defRow("Custom Fields:", config.customFields.length + " client-specific fields included");
+  spacer();
+
+  subsection("Pipeline Inclusion Rules");
+  push(["The following opportunity types are INCLUDED in pipeline totals:"], {});
+  push(["  • Standalone opportunities (normal pursuits)"], {});
+  push(["  • Work Orders (actual work under on-call contracts)"], {});
+  push(["  • Teamed Master opportunities (lead role in teaming arrangements)"], {});
+  spacer();
+  push(["The following opportunity types are EXCLUDED to avoid double-counting:"], {});
+  push(["  • On-Call Master records (contract ceilings, not actual pursuits)"], {});
+  push(["  • Teaming Sub records (partner share — already counted in Teamed Master)"], {});
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 1: EXEC SUMMARY
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 1: EXEC SUMMARY");
+  push(["High-level portfolio health metrics and risk signals."], {});
+  spacer();
+
+  subsection("Key Metrics");
+  defRow("Total Opportunities:", "All pipeline-eligible records in the dataset.");
+  defRow("Active Opportunities:", "Opportunities with Status = Active.");
+  defRow("Total Gross Pipeline:", "Sum of Our Fee for all pipeline-eligible records.");
+  defRow("Active Pipeline:", "Sum of Our Fee for active opportunities only.");
+  defRow("Weighted Pipeline:", "Sum of (Our Fee × Pwin) for active opportunities.");
+  defRow("Average Pwin:", "Average win probability across active opportunities.");
+  defRow("Average Deal Size:", "Total pipeline value ÷ number of opportunities.");
+  spacer();
+
+  subsection("Risk Signals");
+  push(["Signals are generated based on the following thresholds:"], {});
+  defRow("🟢 Healthy:", "Metric is within expected operational norms.");
+  defRow("🟡 Watch:", "Metric shows moderate deviation — monitoring recommended.");
+  defRow("🟠 Elevated:", "Metric exceeds normal variance — action may be needed.");
+  defRow("🔴 Critical:", "Metric indicates significant operational or forecast risk.");
+  spacer();
+
+  subsection("Overall Pipeline Health");
+  push(["Determined by counting Critical and Elevated signals across 6 risk categories:"], {});
+  push(["  1. Stagnant > 60 Days (% of active pipeline not progressing)"], {});
+  push(["  2. Stagnant > 90 Days (% of pipeline effectively stalled)"], {});
+  push(["  3. Overdue Decisions (% past expected award date)"], {});
+  push(["  4. Missing Award Dates (% of active opps without timing data)"], {});
+  push(["  5. Missing Pwin (% of active opps without probability scoring)"], {});
+  push(["  6. Client Concentration (top 3 clients as % of active pipeline)"], {});
+  spacer();
+  defRow("🟢 Healthy:", "0 Critical signals.");
+  defRow("🟠 Needs Attention:", "0 Critical but 2+ Elevated signals.");
+  defRow("🔴 At Risk:", "1+ Critical signals present.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 2: CLIENT ANALYSIS
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 2: CLIENT ANALYSIS");
+  push(["Client-level performance metrics and strategic signals."], {});
+  spacer();
+
+  subsection("Section A: Top Clients by Revenue");
+  push(["Top 15 clients ranked by Total Pipeline $ (sum of Our Fee across all statuses)."], {});
+  spacer();
+
+  subsection("Section B: Top Clients by Volume");
+  push(["Top 15 clients ranked by number of opportunities."], {});
+  spacer();
+
+  subsection("Section C: Win Rate by Client");
+  push(["Clients with 3+ resolved opportunities (won + lost), ranked by Revenue Health."], {});
+  defRow("Win Rate:", "Won opportunities ÷ (Won + Lost).");
+  defRow("Revenue Health:", "Won $ ÷ (Won $ + Lost $).");
+  spacer();
+  push(["Signals identify strategic clients, high-efficiency relationships, and at-risk pursuits:"], {});
+  defRow("🟢 Strategic:", "Win Rate ≥ 50% AND Won $ ≥ org average.");
+  defRow("🟢 High-Efficiency:", "Win Rate ≥ 60% AND resolved opps ≥ 5 AND active pipeline < 10%.");
+  defRow("🟡 Large-Dollar / Low-Win:", "Pipeline ≥ org avg AND Win Rate < 25%.");
+  defRow("🟠 Inefficient High-Volume:", "8+ opps AND Win Rate < 30%.");
+  defRow("🔴 At-Risk Pursuit:", "Win Rate < 20% AND resolved opps ≥ 5.");
+  spacer();
+
+  subsection("Section D: At-Risk Clients");
+  push(["One row per client showing the highest-severity risk signal. Evaluated across 5 risk types:"], {});
+  push(["  1. Concentration Risk (client's % of active pipeline)"], {});
+  push(["  2. Pursuit Efficiency Risk (win rate relative to volume)"], {});
+  push(["  3. Forecast Risk (weighted ÷ active pipeline ratio)"], {});
+  push(["  4. Stagnation Risk (% of client opps stagnant > 60 days)"], {});
+  push(["  5. Slippage Risk (% of client opps past expected award date)"], {});
+  spacer();
+
+  subsection("Section E: Strategic Clients & Growth Opportunities");
+  push(["Positive signals identifying high-value relationships and growth potential:"], {});
+  defRow("🟢 Strategic Client:", "Pipeline > 10% AND Win Rate > 50%.");
+  defRow("🟢 High-Efficiency:", "Win Rate > 60% AND resolved opps ≥ 5.");
+  defRow("🟡 Growth Opportunity:", "Pipeline > 10% AND resolved opps < 3 (emerging relationship).");
+  defRow("🟢 Forecast Leader:", "Forecast confidence > 70% AND active pipeline > $1M.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 3: FORECAST & TIMING
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 3: FORECAST & TIMING");
+  push(["Near-term forecast quality and pipeline timing analysis."], {});
+  spacer();
+
+  subsection("Section 1: Monthly Forecast");
+  push(["Next 12 months of expected awards, bucketed by Estimated Award Date."], {});
+  spacer();
+
+  subsection("Section 2: Confidence Buckets");
+  push(["Active pipeline segmented by win probability:"], {});
+  defRow("High Confidence:", "Pwin > 70%.");
+  defRow("Medium Confidence:", "Pwin 40–70%.");
+  defRow("Low Confidence:", "Pwin < 40%.");
+  spacer();
+  push(["Signal evaluates portfolio-level confidence distribution:"], {});
+  defRow("🟢 High Confidence Dominant:", "High bucket ≥ 50% of active pipeline.");
+  defRow("🟡 Balanced Mix:", "High + Medium ≥ 60%.");
+  defRow("🟠 Medium Confidence Heavy:", "Medium bucket ≥ 50%.");
+  defRow("🔴 Low Confidence Dominant:", "Low bucket is largest portion.");
+  spacer();
+
+  subsection("Section 3: Slippage Analysis");
+  push(["Opportunities past their Estimated Award Date within the forecast window."], {});
+  defRow("Slipped Opp Count:", "Active opps where Award Date < Today.");
+  defRow("% Slipped:", "Slipped opps ÷ total opps expected in window.");
+  spacer();
+
+  subsection("Section 4: Forecast Reliability");
+  defRow("Should Close:", "Raw pipeline $ (sum of Our Fee) in forecast window.");
+  defRow("Likely Close:", "Weighted pipeline $ (sum of Our Fee × Pwin) in window.");
+  defRow("Confidence Ratio:", "Likely Close ÷ Should Close.");
+  spacer();
+  defRow("🟢 Strong:", "Confidence Ratio ≥ 70%.");
+  defRow("🟡 Moderate:", "Confidence Ratio 50–69%.");
+  defRow("🟠 Weak:", "Confidence Ratio 30–49%.");
+  defRow("🔴 Critical Risk:", "Confidence Ratio < 30%.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 4: PIPELINE DISTRIBUTION
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 4: PIPELINE DISTRIBUTION");
+  push(["Person-level pipeline metrics grouped by role (extracted from staff role assignments)."], {});
+  spacer();
+
+  subsection("Section 1: Pipeline View");
+  push(["Active portfolio metrics per person."], {});
+  defRow("Active Opps:", "Count of active opportunities assigned to this person.");
+  defRow("Pipeline $:", "Sum of Our Fee for active opps.");
+  defRow("Weighted $:", "Sum of (Our Fee × Pwin) for active opps.");
+  defRow("Avg Pwin:", "Average win probability across active opps.");
+  spacer();
+
+  subsection("Section 2: Conversion Metrics");
+  push(["Historical win/loss performance. Only shown for people with 5+ closed opportunities."], {});
+  defRow("Win Rate:", "Won opps ÷ (Won + Lost).");
+  defRow("Won $:", "Sum of Our Fee for won opps.");
+  defRow("Lost $:", "Sum of Our Fee for lost opps.");
+  spacer();
+
+  subsection("Section 3: Efficiency Metrics");
+  push(["Pipeline velocity and progression indicators."], {});
+  defRow("Avg Days in Stage:", "Average days active opps have been in current stage.");
+  defRow("Avg Deal Cycle:", "Average time from Date Created to Close Date (closed opps only).");
+  defRow("Stagnant Opps:", "Count and % of opps where current stage duration > 2× stage median.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 5: PIPELINE INTELLIGENCE
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 5: PIPELINE INTELLIGENCE");
+  push(["Operational health metrics: velocity, quality, slippage, aging, and pursuit load."], {});
+  spacer();
+
+  subsection("Section 1: Pipeline Velocity & Aging");
+  push(["Stage-level progression metrics."], {});
+  defRow("Stagnant %:", "% of opps in stage where days > 2× stage median.");
+  defRow("🔴 Bottleneck Stage:", "Stage with highest median duration.");
+  defRow("🔴 Aging Risk:", "Stagnant % ≥ 40%.");
+  defRow("🟢 Healthy Flow:", "Median days < org average.");
+  spacer();
+
+  subsection("Section 2: Pipeline Quality Distribution");
+  push(["Active pipeline segmented by confidence buckets (same as Forecast & Timing, Section 2)."], {});
+  spacer();
+
+  subsection("Section 3: Slippage Snapshot");
+  push(["Stage-level view of opportunities past their Estimated Award Date."], {});
+  defRow("🔴 Forecast Slippage Risk:", "Slipped $ ≥ 30% of active pipeline.");
+  defRow("🟠 Stage-Specific Slippage:", "Most slipped opps concentrated in one stage.");
+  spacer();
+
+  subsection("Section 4: Stagnation Heatmap");
+  push(["Age distribution of active opps by stage, bucketed into <30, 30-60, 60-90, 90+ days."], {});
+  defRow("🔴 Severe Aging Risk:", "90+ day bucket ≥ 40% of stage's opps.");
+  defRow("🟢 Healthy Distribution:", "Under-60-day buckets ≥ 70%.");
+  spacer();
+
+  subsection("Section 5: Pursuit Load vs Quality");
+  push(["Portfolio stress analysis by opportunity owner."], {});
+  defRow("🔴 Overloaded Low-Confidence:", "Opp count ≥ 10 AND weighted ratio < 40% AND stagnant % > 30%.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 6: MARKET INTELLIGENCE
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 6: MARKET INTELLIGENCE");
+  push(["Business unit performance by Firm Org (offices, divisions, practice areas, etc.) and Opportunity Role (Prime, Sub, JV)."], {});
+  spacer();
+
+  subsection("Metrics");
+  defRow("Pipeline $:", "Sum of Our Fee for active opps assigned to this unit.");
+  defRow("Weighted $:", "Sum of (Our Fee × Pwin) for active opps.");
+  defRow("Win Rate:", "Won opps ÷ (Won + Lost). Minimum 5 closed opps required for signal generation.");
+  defRow("Avg Deal:", "Total won $ ÷ won opp count.");
+  defRow("Forecast Confidence:", "Weighted $ ÷ Pipeline $ (forecast quality indicator).");
+  spacer();
+
+  subsection("Signals");
+  push(["Signals require 5+ closed opportunities. Below 5, signal shows 'Insufficient data'."], {});
+  defRow("🟢 Strategic Growth Area:", "Pipeline ≥ org avg AND Win Rate ≥ 50% AND Forecast Confidence ≥ 50%.");
+  defRow("🟢 High-Efficiency Practice:", "Win Rate ≥ 60% AND Avg Deal ≥ org median.");
+  defRow("🟢 Large Deal Strength:", "Avg Deal ≥ 125% of org median AND Win Rate ≥ 35%.");
+  defRow("🟡 Moderate Forecast Confidence:", "Forecast Confidence 40–49%.");
+  defRow("🟠 Low Forecast Quality:", "Forecast Confidence 25–39%.");
+  defRow("🟠 Low Conversion Performance:", "Win Rate < 35%.");
+  defRow("🟠 Small Deal Concentration:", "Avg Deal < 60% of org median.");
+  defRow("🔴 Forecast Risk:", "Forecast Confidence < 25% AND Pipeline ≥ org avg.");
+  defRow("🔴 Pursuit Efficiency Risk:", "Win Rate < 20% AND Pipeline ≥ org avg AND closed opps ≥ 8.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 7: OPPORTUNITY DATA
+  // ══════════════════════════════════════════════════════════════
+  section("SHEET 7: OPPORTUNITY DATA");
+  push(["Complete raw opportunity data extract with all enabled fields and custom fields."], {});
+  push(["Includes computed columns: Status, Opp Type, Master Contract reference."], {});
+  push(["Autofilter and freeze panes enabled for sorting and analysis."], {});
+  spacer();
+
+  subsection("Computed Fields");
+  defRow("Status:", "Active / Won / Lost / Closed (derived from Stage Name and Active Indicator).");
+  defRow("Opp Type:", "Standalone / Work Order / Teamed Master / On-Call Master / Teaming Sub.");
+  defRow("Master Contract:", "For Work Orders and Teaming Subs, shows parent contract number and name.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // GLOSSARY
+  // ══════════════════════════════════════════════════════════════
+  section("GLOSSARY");
+  defRow("Our Fee:", "Firm's estimated fee for the opportunity (client-labeled field, typically IFIRMFEE).");
+  defRow("Weighted Value:", "Our Fee × Pwin (probability-adjusted pipeline value).");
+  defRow("Pwin:", "Win probability (0–100% converted to decimal for calculations).");
+  defRow("Pipeline-Eligible:", "Records included in pipeline totals (excludes On-Call Masters and Teaming Subs).");
+  defRow("Stagnant:", "Opportunity where current stage duration exceeds 2× the median for that stage.");
+  defRow("Forecast Confidence:", "Weighted pipeline ÷ raw pipeline (measures forecast quality).");
+  defRow("Revenue Health:", "Won $ ÷ (Won $ + Lost $) — measures $ efficiency of wins vs losses.");
+  defRow("Org Average / Median:", "Portfolio-level benchmark calculated across all pipeline-eligible records.");
+  spacer();
+
+  // ══════════════════════════════════════════════════════════════
+  // FOOTER
+  // ══════════════════════════════════════════════════════════════
+  spacer();
+  push(["ExecIQ v" + VERSION + " — Dynamic Pipeline Intelligence for Unanet CRM"], {note:true});
+  push(["Generated: " + new Date().toLocaleString("en-US")], {note:true});
+
+  // ── Build worksheet ──────────────────────────────────────────
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  var maxCols = 2; // Documentation uses 2-column layout (term, definition)
+
+  // Apply styles
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    var isSectionHdr    = m.sectionHdr    || false;
+    var isSubsectionHdr = m.subsectionHdr || false;
+    var isTitleRow      = m.titleRow      || false;
+    var isDefRow        = m.defRow        || false;
+    var isNote          = m.note          || false;
+
+    var styleCols = (isSectionHdr||isTitleRow||isSubsectionHdr||isNote) ? maxCols : Math.max(rowData.length, 1);
+
+    for(var ci=0; ci<styleCols; ci++){
+      var addr = XLSX.utils.encode_cell({r:ri, c:ci});
+      if(!ws[addr]) ws[addr] = {v:"", t:"s"};
+
+      var fill, fclr, fbold, fsize, alignment;
+
+      if(isTitleRow){
+        fill = C_NAVY; fclr = "FFFFFF"; fbold = true; fsize = 10;
+        alignment = {horizontal:"left", vertical:"center", wrapText:false};
+      } else if(isSectionHdr){
+        fill = C_BLUE; fclr = "FFFFFF"; fbold = true; fsize = 10;
+        alignment = {horizontal:"left", vertical:"center", wrapText:false};
+      } else if(isSubsectionHdr){
+        fill = C_LTBLU; fclr = "000000"; fbold = true; fsize = 10;
+        alignment = {horizontal:"left", vertical:"center", wrapText:false};
+      } else if(isDefRow){
+        fill = ci === 0 ? C_DGREY : C_WHITE;
+        fclr = "000000"; fbold = ci === 0; fsize = 10;
+        alignment = {horizontal:"left", vertical:"top", wrapText:true};
+      } else if(isNote){
+        fill = C_DGREY; fclr = "666666"; fbold = false; fsize = 9;
+        alignment = {horizontal:"center", vertical:"center", wrapText:false};
+      } else {
+        fill = null; fclr = "000000"; fbold = false; fsize = 10;
+        alignment = {horizontal:"left", vertical:"top", wrapText:true};
+      }
+
+      ws[addr].s = {
+        font:      { name:"Arial", sz:fsize, bold:fbold, color:{rgb:fclr} },
+        fill:      fill ? {patternType:"solid", fgColor:{rgb:fill}} : {patternType:"none"},
+        alignment: alignment
+      };
+    }
+  });
+
+  // Merges for section headers, title, and notes
+  if(!ws["!merges"]) ws["!merges"]=[];
+  aoa.forEach(function(rowData, ri){
+    var m = meta[ri];
+    if(m.sectionHdr||m.subsectionHdr||m.titleRow||m.note){
+      ws["!merges"].push({s:{r:ri,c:0},e:{r:ri,c:maxCols-1}});
+    }
+  });
+
+  // Row heights
+  ws["!rows"] = aoa.map(function(rowData, ri){
+    var m = meta[ri];
+    if(m.titleRow)       return {hpt:22};
+    if(m.sectionHdr)     return {hpt:18};
+    if(m.subsectionHdr)  return {hpt:16};
+    if(m.note)           return {hpt:12};
+    if(m.defRow)         return {hpt:28}; // Taller for wrapped definition text
+    if(!rowData||!rowData.length||!rowData[0]) return {hpt:8};
+    return {hpt:15};
+  });
+
+  // Column widths
+  ws["!cols"] = [
+    {wch:32}, // A — Term
+    {wch:95}, // B — Definition (wide for wrapped text)
+  ];
+
+  ws["!ref"] = "A1:" + XLSX.utils.encode_cell({r:aoa.length-1, c:maxCols-1});
+  return ws;
+} 
 
 // ─────────────────────────────────────────────────────────────
 // EXEC SUMMARY SHEET
@@ -4732,6 +5132,9 @@ async function main(isRefresh){
   UI.status("Building workbook...");
   var wb = XLSX.utils.book_new();
 
+UI.log("Building Documentation...");
+XLSX.utils.book_append_sheet(wb, buildDocumentationSheet(schema, config, filterSettings), "Documentation");
+
   UI.log("Building Exec Summary...");
   XLSX.utils.book_append_sheet(wb, buildExecSummarySheet(cleanRows, schema, config), "Exec Summary");
 
@@ -4753,7 +5156,7 @@ XLSX.utils.book_append_sheet(wb, buildMarketIntelligenceSheet(cleanRows, schema,
   UI.log("Building Opportunity Data...");
   XLSX.utils.book_append_sheet(wb, buildOpportunitySheet(cleanRows, schema), "Opportunity Data");
 
-  UI.log("✓ Workbook ready — 7 sheets", "ls");
+  UI.log("✓ Workbook ready — 8 sheets", "ls");
   UI.prog(100);
   UI.status(cleanRows.length + " opportunities ready for export");
   UI.log("✓ Done — click Export to download.", "ls");
