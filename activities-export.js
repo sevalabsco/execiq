@@ -320,7 +320,7 @@
         });
         
         // ─── 2. BUILD OWNER ANALYSIS ─────────────────────────────
-        const ownerMap = {};
+        const ownerMapRaw = {};
         
         activities.forEach(act => {
             const owners = splitField(act['Owner(s)']);
@@ -332,8 +332,8 @@
             owners.forEach(owner => {
                 if (!owner) return;
                 
-                if (!ownerMap[owner]) {
-                    ownerMap[owner] = {
+                if (!ownerMapRaw[owner]) {
+                    ownerMapRaw[owner] = {
                         total: 0,
                         companies: new Set(),
                         contacts: new Set(),
@@ -342,7 +342,7 @@
                     };
                 }
                 
-                const o = ownerMap[owner];
+                const o = ownerMapRaw[owner];
                 o.total++;
                 companies.forEach(c => o.companies.add(c));
                 contacts.forEach(c => o.contacts.add(c));
@@ -352,6 +352,16 @@
                     o.lastActivity = startDate;
                 }
             });
+        });
+        
+        // ─── SUPPRESS OWNERS WHO HAVEN'T LOGGED ACTIVITY IN 3+ YEARS ─
+        // Filter out owners whose most recent activity is older than 3 years.
+        // Mirrors the client suppression pattern above.
+        const ownerMap = {};
+        Object.entries(ownerMapRaw).forEach(([owner, data]) => {
+            if (data.lastActivity && data.lastActivity >= day3years) {
+                ownerMap[owner] = data;
+            }
         });
         
         // ─── 3. BUILD OPPORTUNITY ANALYSIS ───────────────────────
