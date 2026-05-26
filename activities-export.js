@@ -1055,11 +1055,19 @@
             return stripHTML(html);
         }
         
-        // Decode status
+        // Decode the stored STATUS field.
+        // Confirmed via diagnostic + Unanet UI comparison:
+        //   STATUS === 0  →  Completed
+        //   STATUS === 1  →  Not Started
+        // (The mapping is counterintuitive — 0 means "done" — but this matches
+        // what Unanet's grid displays.)
+        // Other values are passed through with a "Status N" label so we can
+        // identify any additional states (In Progress, Cancelled, etc.) if they exist.
         function decodeStatus(statusCode) {
-            if (statusCode === 0) return 'Not Started';
-            if (statusCode === 1) return 'Completed';
-            return statusCode;
+            if (statusCode === 0) return 'Completed';
+            if (statusCode === 1) return 'Not Started';
+            if (statusCode === null || statusCode === undefined || statusCode === '') return '';
+            return `Status ${statusCode}`;
         }
         
         // Parse date string and return as JavaScript Date object
