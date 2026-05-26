@@ -58,6 +58,8 @@
     dateRangeSelect.style.cssText = 'width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;';
     dateRangeSelect.innerHTML = `
         <option value="all">All dates</option>
+        <option value="last7">Last 7 days</option>
+        <option value="last14">Last 14 days</option>
         <option value="last30">Last 30 days</option>
         <option value="last60">Last 60 days</option>
         <option value="last90" selected>Last 90 days</option>
@@ -171,6 +173,14 @@
         const now = new Date();
         
         switch(filters.dateRange) {
+            case 'last7':
+                startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                endDate = now;
+                break;
+            case 'last14':
+                startDate = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+                endDate = now;
+                break;
             case 'last30':
                 startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
                 endDate = now;
@@ -231,6 +241,8 @@
         const day60 = new Date(now - 60 * 24 * 60 * 60 * 1000);
         const day90 = new Date(now - 90 * 24 * 60 * 60 * 1000);
         const day180 = new Date(now - 180 * 24 * 60 * 60 * 1000);
+        // 3-year suppression cutoff: companies with no contact past this date are excluded
+        const day3years = new Date(now - 3 * 365 * 24 * 60 * 60 * 1000);
         
         // Helper: Split semicolon-delimited fields into arrays
         function splitField(val) {
@@ -239,7 +251,7 @@
         }
         
         // ─── 1. BUILD CLIENT ANALYSIS ───────────────────────────
-        const clientMap = {};
+        const clientMapRaw = {};
         
         activities.forEach(act => {
             const companies = splitField(act['Company(ies)']);
@@ -252,8 +264,8 @@
             companies.forEach(company => {
                 if (!company) return;
                 
-                if (!clientMap[company]) {
-                    clientMap[company] = {
+                if (!clientMapRaw[company]) {
+                    clientMapRaw[company] = {
                         total: 0,
                         last30: 0,
                         last60: 0,
@@ -271,7 +283,7 @@
                     };
                 }
                 
-                const client = clientMap[company];
+                const client = clientMapRaw[company];
                 client.total++;
                 client.activities.push(act);
                 
@@ -296,6 +308,15 @@
                     client.lastCallType = callType;
                 }
             });
+        });
+        
+        // ─── SUPPRESS CLIENTS NOT CONTACTED IN 3+ YEARS ─────────
+        // Filter out companies whose most recent activity is older than 3 years
+        const clientMap = {};
+        Object.entries(clientMapRaw).forEach(([company, data]) => {
+            if (data.lastActivity && data.lastActivity >= day3years) {
+                clientMap[company] = data;
+            }
         });
         
         // ─── 2. BUILD OWNER ANALYSIS ─────────────────────────────
@@ -1131,6 +1152,9 @@
             // Parse activities into structured data
             updateStatus('🔄 Parsing activity data...', 60);
             
+            // NOTE: Column order below controls the output column order in the Excel sheet.
+            // Order: Owner, Companies, Subject, Comments, Start Date, End Date, Status,
+            //        Call Type, Call Disposition, Attendees, Leads, Opportunities, Projects, Contacts
             let parsedActivities = allActivities.map(activity => {
                 const activityObj = {};
                 columns.forEach((col, idx) => {
@@ -1139,19 +1163,19 @@
                 
                 return {
                     'Owner(s)': parseLinkedField(activityObj.CALLERS),
-                    'Call Type': activityObj.CALLTYPE || '',
-                    'Status': decodeStatus(activityObj.STATUS),
-                    'Start Date': parseDate(activityObj.STARTDATEDATEONLY),
-                    'End Date': parseDate(activityObj.ENDDATEDATEONLY),
                     'Company(ies)': parseLinkedField(activityObj.LINKEDCOMPANIES),
                     'Subject': activityObj.SUBJECT || '',
                     'Comments': stripHTML(activityObj.COMMENTS),
+                    'Start Date': parseDate(activityObj.STARTDATEDATEONLY),
+                    'End Date': parseDate(activityObj.ENDDATEDATEONLY),
+                    'Status': decodeStatus(activityObj.STATUS),
+                    'Call Type': activityObj.CALLTYPE || '',
+                    'Call Disposition': activityObj.CALLDISPOSITION || '',
                     'Attendee(s)': parseLinkedField(activityObj.ATTENDEES),
                     'Lead(s)': parseLinkedField(activityObj.LINKEDLEADS),
                     'Opportunity(ies)': parseLinkedField(activityObj.LINKEDOPPORTUNITIES),
                     'Project(s)': parseLinkedField(activityObj.LINKEDPROJECTS),
-                    'Contact(s)': parseLinkedField(activityObj.LINKEDCONTACTS),
-                    'Call Disposition': activityObj.CALLDISPOSITION || ''
+                    'Contact(s)': parseLinkedField(activityObj.LINKEDCONTACTS)
                 };
             });
             
@@ -1274,9 +1298,10 @@
                 }
             }
             
-            // Format date columns
+            // Format date columns - Start Date and End Date are now columns E and F
+            // (5th and 6th columns, 0-indexed positions 4 and 5)
             for (let row = range.s.r + 1; row <= range.e.r; row++) {
-                ['D', 'E'].forEach(col => {
+                ['E', 'F'].forEach(col => {
                     const cellRef = col + (row + 1);
                     if (ws[cellRef] && ws[cellRef].v instanceof Date) {
                         ws[cellRef].t = 'd';
