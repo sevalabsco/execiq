@@ -1013,15 +1013,20 @@
         }
         
         function closeDialog() {
-            setTimeout(() => {
-                if (document.body.contains(overlay)) {
-                    document.body.removeChild(overlay);
-                }
-            }, 3000);
+            // TEMP: auto-close disabled for debugging — use the × button to close manually
+            return;
+            // setTimeout(() => {
+            //     if (document.body.contains(overlay)) {
+            //         document.body.removeChild(overlay);
+            //     }
+            // }, 3000);
         }
         
         const API_URL = 'https://services.cosential.com/com/model/activities/callLog.cfc';
         const BATCH_SIZE = 100;
+        const CONCURRENCY = 5;  // Number of parallel fetches in flight at once.
+                                // 5 is conservative — increase if Unanet handles it well.
+        const RETRY_DELAY_MS = 500;  // Brief pause before retrying a failed batch.
         
         // Helper function to strip HTML and extract text
         function stripHTML(html) {
@@ -1120,6 +1125,19 @@
             return await response.json();
         }
         
+        // Fetch with one retry attempt — cheap insurance against transient failures
+        // when running batches in parallel. If both attempts fail, the error propagates
+        // up and the export aborts cleanly rather than producing partial data.
+        async function fetchActivitiesWithRetry(start) {
+            try {
+                return await fetchActivities(start);
+            } catch (err) {
+                console.warn(`Batch at offset ${start} failed, retrying once...`, err);
+                await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                return await fetchActivities(start);  // any error here propagates
+            }
+        }
+        
         try {
             updateStatus('🚀 Starting export...', 5);
             
@@ -1140,29 +1158,118 @@
             
             // Fetch all activities
             let allActivities = [];
-            let start = 0;
-            let totalRecords = 0;
             
             updateStatus('📥 Fetching activities from Unanet...', 10);
             
             // First request to get total count
             const firstBatch = await fetchActivities(0);
-            totalRecords = firstBatch.TOTAL;
+            
+            // Extract total record count defensively — the API response shape
+            // varies across Unanet/Cosential environments. We've seen:
+            //   - firstBatch.TOTAL (top level)
+            //   - firstBatch.DATA.TOTAL
+            //   - TOTALRECORDCOUNT as a column inside each row
+            // Try each in order; warn loudly if we can't find it.
+            let totalRecords = 0;
+            const cols = firstBatch.DATA?.COLUMNS || [];
+            const firstRow = firstBatch.DATA?.DATA?.[0];
+            const trcIdx = cols.indexOf('TOTALRECORDCOUNT');
+            
+            if (typeof firstBatch.TOTAL === 'number') {
+                totalRecords = firstBatch.TOTAL;
+            } else if (typeof firstBatch.DATA?.TOTAL === 'number') {
+                totalRecords = firstBatch.DATA.TOTAL;
+            } else if (trcIdx !== -1 && firstRow && typeof firstRow[trcIdx] === 'number') {
+                totalRecords = firstRow[trcIdx];
+            } else {
+                // Couldn't find a count — log the response shape so we can diagnose.
+                console.error('⚠️ Could not determine totalRecords. firstBatch keys:',
+                    Object.keys(firstBatch),
+                    'DATA keys:', firstBatch.DATA ? Object.keys(firstBatch.DATA) : 'no DATA',
+                    'columns:', cols
+                );
+                throw new Error(
+                    'Unable to determine total record count from API response. ' +
+                    'Check console for response structure.'
+                );
+            }
+            
             updateStatus(`📊 Found ${totalRecords} activities in system`, 15);
+            console.log(`[EXPORT DEBUG] totalRecords = ${totalRecords}, type = ${typeof totalRecords}`);
             
             // Process first batch
             const columns = firstBatch.DATA.COLUMNS;
             const data = firstBatch.DATA.DATA;
             allActivities.push(...data);
+            console.log(`[EXPORT DEBUG] First batch added, allActivities.length = ${allActivities.length}`);
             
-            // Fetch remaining batches
-            start = BATCH_SIZE;
-            while (start < totalRecords) {
-                const currentProgress = 15 + (start / totalRecords) * 40;
-                updateStatus(`📥 Fetching activities ${start} to ${Math.min(start + BATCH_SIZE, totalRecords)}...`, currentProgress);
-                const batch = await fetchActivities(start);
-                allActivities.push(...batch.DATA.DATA);
-                start += BATCH_SIZE;
+            // Fetch remaining batches in parallel with controlled concurrency.
+            // We build a queue of offsets to fetch, then run CONCURRENCY workers
+            // that each pull the next offset off the queue, fetch it, repeat.
+            // This avoids the "fire all 28 at once" failure mode from before.
+            const offsets = [];
+            for (let s = BATCH_SIZE; s < totalRecords; s += BATCH_SIZE) {
+                offsets.push(s);
+            }
+            console.log(`[EXPORT DEBUG] Built offsets queue:`, offsets);
+            
+            const totalBatches = offsets.length;
+            let completedBatches = 0;
+            let nextIndex = 0;  // shared cursor into the offsets queue
+            
+            updateStatus(`📥 Fetching ${totalBatches} remaining batches (${CONCURRENCY} parallel)...`, 15);
+            
+            async function worker(workerId) {
+                console.log(`[EXPORT DEBUG] >>> Worker ${workerId} STARTED execution`);
+                while (true) {
+                    const myIndex = nextIndex++;
+                    console.log(`[EXPORT DEBUG] Worker ${workerId} claimed index ${myIndex} (queue length ${offsets.length})`);
+                    if (myIndex >= offsets.length) {
+                        console.log(`[EXPORT DEBUG] Worker ${workerId} done (queue drained)`);
+                        return;
+                    }
+                    
+                    const offset = offsets[myIndex];
+                    console.log(`[EXPORT DEBUG] Worker ${workerId} fetching offset ${offset}`);
+                    let batch;
+                    try {
+                        batch = await fetchActivitiesWithRetry(offset);
+                    } catch (err) {
+                        console.error(`[EXPORT DEBUG] Worker ${workerId} FAILED at offset ${offset}:`, err);
+                        throw err;
+                    }
+                    const rowsReceived = batch?.DATA?.DATA?.length ?? 0;
+                    console.log(`[EXPORT DEBUG] Worker ${workerId} got offset ${offset}: ${rowsReceived} rows`);
+                    allActivities.push(...batch.DATA.DATA);
+                    
+                    completedBatches++;
+                    const progress = 15 + (completedBatches / totalBatches) * 40;
+                    updateStatus(
+                        `📥 Batch ${completedBatches}/${totalBatches} complete (offset ${offset})`,
+                        progress
+                    );
+                }
+            }
+            
+            // Spin up CONCURRENCY workers and wait for all of them to drain the queue.
+            // Promise.all here means: if any worker throws (e.g. after retry exhausted),
+            // the whole export aborts — which is what we want, rather than silently
+            // producing partial data.
+            const workerCount = Math.min(CONCURRENCY, totalBatches);
+            console.log(`[EXPORT DEBUG] About to spin up ${workerCount} workers`);
+            
+            try {
+                const workerPromises = [];
+                for (let i = 0; i < workerCount; i++) {
+                    console.log(`[EXPORT DEBUG] Creating worker ${i}`);
+                    workerPromises.push(worker(i));
+                }
+                console.log(`[EXPORT DEBUG] All ${workerPromises.length} workers created, awaiting Promise.all...`);
+                await Promise.all(workerPromises);
+                console.log(`[EXPORT DEBUG] Promise.all resolved, allActivities.length = ${allActivities.length}`);
+            } catch (err) {
+                console.error(`[EXPORT DEBUG] Promise.all REJECTED:`, err);
+                throw err;
             }
             
             updateStatus(`✅ Fetched all ${allActivities.length} activities`, 55);
