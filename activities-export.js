@@ -456,21 +456,10 @@
             else if (data.last90 >= 3) freqScore = 5;
             else if (data.last90 >= 1) freqScore = 2;
             
-            // Meeting Engagement (15 pts)
-            let meetingScore = 0;
-            if (data.meetings90 >= 8) meetingScore = 15;
-            else if (data.meetings90 >= 5) meetingScore = 12;
-            else if (data.meetings90 >= 3) meetingScore = 8;
-            else if (data.meetings90 >= 1) meetingScore = 4;
-            
-            // Contact Coverage (10 pts)
+            // Contact count is still tracked (displayed in the output table)
+            // but no longer scored — removed per business decision that contact
+            // count was not a meaningful signal in this domain.
             const contactCount = data.contacts.size;
-            let contactScore = 0;
-            if (contactCount >= 8) contactScore = 10;
-            else if (contactCount >= 6) contactScore = 8;
-            else if (contactCount >= 4) contactScore = 6;
-            else if (contactCount >= 2) contactScore = 3;
-            else if (contactCount >= 1) contactScore = 1;
             
             // Owner Coverage (10 pts)
             const ownerCount = data.owners.size;
@@ -491,24 +480,38 @@
             else if (hasOpps && hasRecentOppActivity) oppScore = 7;
             else if (hasOpps && !hasRecentOppActivity) oppScore = 3;
             
-            const totalScore = recencyScore + freqScore + meetingScore + contactScore + ownerScore + oppScore;
+            // Total score out of 65: Recency (25) + Frequency (20) + Owner Coverage (10) + Opportunity (10)
+            const totalScore = recencyScore + freqScore + ownerScore + oppScore;
             
-            // Status
+            // Status (out of 65 pts max)
+            //   Healthy        55-65   Strong, active relationship
+            //   Stable         45-54   Consistent engagement but room to deepen
+            //   Watch          30-44   Declining or inconsistent activity
+            //   Elevated Risk  15-29   Weak engagement and limited momentum
+            //   Critical        0-14   Relationship largely dormant or disconnected
             let status = 'Critical';
-            if (totalScore >= 85) status = 'Healthy';
-            else if (totalScore >= 70) status = 'Stable';
-            else if (totalScore >= 55) status = 'Watch';
-            else if (totalScore >= 40) status = 'Elevated Risk';
+            if (totalScore >= 55) status = 'Healthy';
+            else if (totalScore >= 45) status = 'Stable';
+            else if (totalScore >= 30) status = 'Watch';
+            else if (totalScore >= 15) status = 'Elevated Risk';
             
-            // Critical Flags - IMPROVED LOGIC
+            // Critical Flags
             const flags = [];
             if (daysSince >= 90) flags.push('No Activity 90+ Days');
-            if (contactCount === 0) flags.push('No Contacts');
-            else if (contactCount === 1) flags.push('Single Contact');
+            // Slowing Down: last activity was 30-60 days ago — recent enough that
+            // "90+ Days" hasn't triggered yet, but cadence is clearly fading.
+            // Early-warning signal before a relationship goes fully dormant.
+            else if (daysSince >= 30 && daysSince <= 60) flags.push('Slowing Down');
+            
             if (ownerCount === 0) flags.push('No Owner');
             else if (ownerCount === 1) flags.push('Single Owner');
+            
             if (hasOpps && !hasRecentOppActivity) flags.push('Stale Pursuit');
-            if (data.meetings90 === 0 && data.total > 5) flags.push('No Meetings');
+            
+            // Low Frequency: company is still being touched (daysSince <= 30)
+            // but only sporadically — fewer than 3 activities in last 90 days.
+            // Catches relationships that look engaged on the surface but aren't sustained.
+            if (daysSince <= 30 && data.last90 <= 2) flags.push('Low Frequency');
             
             healthScores.push({
                 company,
@@ -1013,13 +1016,11 @@
         }
         
         function closeDialog() {
-            // TEMP: auto-close disabled for debugging — use the × button to close manually
-            return;
-            // setTimeout(() => {
-            //     if (document.body.contains(overlay)) {
-            //         document.body.removeChild(overlay);
-            //     }
-            // }, 3000);
+            setTimeout(() => {
+                if (document.body.contains(overlay)) {
+                    document.body.removeChild(overlay);
+                }
+            }, 3000);
         }
         
         const API_URL = 'https://services.cosential.com/com/model/activities/callLog.cfc';
